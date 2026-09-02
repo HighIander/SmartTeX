@@ -9,6 +9,7 @@
   globalThis.__smartTeXCommentsLoaded = true;
 
   const extensionApi = globalThis.browser ?? globalThis.chrome;
+  const interactionTasks = globalThis.SmartTeXInteractionTasks;
   const PROFILE_KEY = globalThis.SmartTeXCommentProfile?.KEY || "smarttex:comment-profile:v1";
   const AUTHOR_ID_KEY = "smarttex:comment-author-id:v1";
   const REQUEST_EVENT = "smarttex:citation-editor-request";
@@ -75,9 +76,18 @@
   let iconFocusedThreadId = "";
   let iconFocusedThreadTimer = 0;
   let paneGeometryFrame = 0;
+  let paneGeometryTimer = 0;
   let dockedEditorSurface = null;
   let dockedSourceLayoutPane = null;
   let dockedSourceInlineStyle = null;
+
+  interactionTasks?.subscribe?.(() => {
+    window.clearTimeout(paneGeometryTimer);
+    paneGeometryTimer = 0;
+    if (paneGeometryFrame) cancelAnimationFrame(paneGeometryFrame);
+    paneGeometryFrame = 0;
+    // The post-idle editor-state event schedules the replacement geometry pass.
+  });
   let dockedPdfLayoutPane = null;
   let paneLayoutResizeObserver = null;
   let editorResizeTimer = 0;
@@ -3715,7 +3725,17 @@
   }
 
   function schedulePaneGeometry() {
-    if (!paneOpen || paneGeometryFrame) return;
+    if (!paneOpen) return;
+    const idleDelay = Math.max(0, Number(interactionTasks?.keyboardIdleRemaining?.()) || 0);
+    if (idleDelay > 0) {
+      if (paneGeometryTimer) return;
+      paneGeometryTimer = window.setTimeout(() => {
+        paneGeometryTimer = 0;
+        schedulePaneGeometry();
+      }, idleDelay);
+      return;
+    }
+    if (paneGeometryFrame || paneGeometryTimer) return;
     paneGeometryFrame = requestAnimationFrame(applyPaneGeometry);
   }
 
@@ -4485,7 +4505,11 @@
 
   window.addEventListener(STATE_EVENT, (event) => {
     let state = null;
-    try { state = JSON.parse(String(event.detail || "null")); } catch (_error) { return; }
+    try {
+      state = interactionTasks?.parseEditorState
+        ? interactionTasks.parseEditorState(event.detail)
+        : JSON.parse(String(event.detail || "null"));
+    } catch (_error) { return; }
     if (!state) return;
     const previousFileName = String(currentState?.fileName || "");
     const fileChanged = Boolean(previousFileName) && !fileMatches(previousFileName, state.fileName);
@@ -4661,8 +4685,12 @@
   if (document.body) themeObserver.observe(document.body, { attributes: true, attributeFilter: ["class", "data-theme", "style"] });
 
   let paneReattachFrame = 0;
-  const layoutObserver = new MutationObserver(() => {
+  const layoutObserver = new MutationObserver((mutations) => {
     if (!paneOpen) return;
+    const editorSelector = ".ace_editor, .cm-editor, #ide-redesign-panel-source-editor";
+    if (mutations.every((mutation) => (
+      mutation.target instanceof Element && mutation.target.closest(editorSelector)
+    ))) return;
     if (!pane?.isConnected && !paneReattachFrame) {
       paneReattachFrame = requestAnimationFrame(() => {
         paneReattachFrame = 0;
@@ -4697,6 +4725,7 @@
     layoutObserver.disconnect();
     if (paneReattachFrame) cancelAnimationFrame(paneReattachFrame);
     if (paneGeometryFrame) cancelAnimationFrame(paneGeometryFrame);
+    window.clearTimeout(paneGeometryTimer);
     clearEditorDock();
     clearPaneLayoutObserver();
     hideSelectionPopup();

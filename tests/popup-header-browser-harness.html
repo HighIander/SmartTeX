@@ -1,0 +1,38 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><link rel="stylesheet" href="../content.css"></head>
+<body>
+<div class="cm-editor" style="position:fixed;inset:0"></div>
+<aside id="smarttex-equation-preview" class="smarttex-preview-visible" style="left:100px;top:100px;width:420px;height:260px;">
+  <div class="smarttex-preview-heading"><span class="smarttex-preview-title">Figure preview</span><span class="smarttex-preview-heading-actions"><button class="smarttex-preview-close">×</button></span></div>
+  <div class="smarttex-equation-output">Preview</div>
+</aside>
+<script src="../popup-gate.js"></script>
+<script>
+(async () => {
+  const popup = document.getElementById('smarttex-equation-preview');
+  popup.hidden = false;
+  const ui = globalThis.SmartTeXPopupUI.enhance(popup, {type:'image'});
+  const heading = popup.querySelector('.smarttex-preview-heading');
+  await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+  const rect = heading.getBoundingClientRect();
+  const x = rect.left + 100, y = rect.top + rect.height/2;
+  const hit = document.elementFromPoint(x,y);
+  const before = popup.getBoundingClientRect();
+  hit.dispatchEvent(new PointerEvent('pointerdown',{bubbles:true,cancelable:true,clientX:x,clientY:y,button:0,pointerId:17}));
+  window.dispatchEvent(new PointerEvent('pointermove',{bubbles:true,cancelable:true,clientX:x+45,clientY:y+35,button:0,pointerId:17}));
+  window.dispatchEvent(new PointerEvent('pointerup',{bubbles:true,cancelable:true,clientX:x+45,clientY:y+35,button:0,pointerId:17}));
+  await new Promise(r => requestAnimationFrame(r));
+  const after = popup.getBoundingClientRect();
+  const result = {
+    cursor: getComputedStyle(heading).cursor,
+    pointerEvents: getComputedStyle(heading).pointerEvents,
+    hitClass: hit && hit.className,
+    movedX: Math.round(after.left-before.left),
+    movedY: Math.round(after.top-before.top),
+    temporaryMoved: popup.dataset.smarttexTemporaryMoved || ''
+  };
+  document.body.setAttribute('data-test-result', JSON.stringify(result));
+  document.body.textContent = JSON.stringify(result);
+})();
+</script>
+</body></html>

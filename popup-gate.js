@@ -136,6 +136,17 @@
   const RELATIVE_SCALE_TYPES = new Set(["image", "equation", "table"]);
   const states = new WeakMap();
 
+  /*
+   * Popup sizing implementation note: the complete user-facing popup/outline
+   * requirements are documented in the "SMARTTEX POPUP / OUTLINE BEHAVIOR
+   * CONTRACT" comment near the top of content.js. In this module specifically,
+   * slider-relative sizes are persistent defaults, edge/corner drags are
+   * temporary for the current popup, intrinsic geometry must never be rebased
+   * from an already fitted/scaled rectangle, and scrollbars are not a sizing
+   * decision here: content.js first grows the window and then solves a live-DOM
+   * auto-fit down to the 75% floor before enabling its scrollbar fallback.
+   */
+
   function readSizes() {
     try {
       const parsed = JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}");
@@ -235,20 +246,40 @@
     return { widthRatio, heightRatio };
   }
 
-  function resizePopup(popup, state, type, requested, { live = false, persist = false } = {}) {
+  function resizePopup(
+    popup,
+    state,
+    type,
+    requested,
+    {
+      live = false,
+      persist = false,
+      contentScaleOverride = null,
+      widthLimit = null,
+      heightLimit = null
+    } = {}
+  ) {
     const naturalSize = state.naturalSizes[type];
     if (!naturalSize) return false;
 
     const bounds = viewportBounds();
     const minimum = MINIMUM_SIZE[type];
     const rect = popup.getBoundingClientRect();
+    const maximumWidth = Math.max(
+      1,
+      Math.min(bounds.width, Number(widthLimit) > 0 ? Number(widthLimit) : bounds.width)
+    );
+    const maximumHeight = Math.max(
+      1,
+      Math.min(bounds.height, Number(heightLimit) > 0 ? Number(heightLimit) : bounds.height)
+    );
     const width = Math.min(
-      bounds.width,
-      Math.max(Math.min(minimum.width, bounds.width), Number(requested.width) || rect.width)
+      maximumWidth,
+      Math.max(Math.min(minimum.width, maximumWidth), Number(requested.width) || rect.width)
     );
     const height = Math.min(
-      bounds.height,
-      Math.max(Math.min(minimum.height, bounds.height), Number(requested.height) || rect.height)
+      maximumHeight,
+      Math.max(Math.min(minimum.height, maximumHeight), Number(requested.height) || rect.height)
     );
     const requestedLeft = Number.isFinite(Number(requested.left)) ? Number(requested.left) : rect.left;
     const requestedTop = Number.isFinite(Number(requested.top)) ? Number(requested.top) : rect.top;
@@ -272,7 +303,9 @@
 
     const widthRatio = width / Math.max(1, naturalSize.width);
     const heightRatio = height / Math.max(1, naturalSize.height);
-    const contentScale = Math.min(widthRatio, heightRatio);
+    const contentScale = Number(contentScaleOverride) > 0
+      ? Number(contentScaleOverride)
+      : Math.min(widthRatio, heightRatio);
     setContentScale(popup, contentScale);
 
     if (persist) {
@@ -303,12 +336,15 @@
     const token = ++state.restoreToken;
     const restore = () => {
       if (token !== state.restoreToken || state.type !== type) return;
+      // During staged opening the popup is mounted only so its final content can
+      // be measured. Do not capture or apply size until content.js explicitly
+      // commits the fully rendered geometry.
+      if (popup.dataset.smarttexStaging === "true") return;
       const rect = measurableRect(popup);
       if (!rect || popup.dataset.smarttexUserSized === "true") return;
       state.naturalSizes[type] = { width: rect.width, height: rect.height };
-      if (applySize(popup, state, type, sizes[type])) return;
       const relativeScale = relativeScaleFor(type);
-      if (Math.abs(relativeScale - 1) > 0.001) {
+      if (RELATIVE_SCALE_TYPES.has(type) && Math.abs(relativeScale - 1) > 0.001) {
         applySize(popup, state, type, {
           widthRatio: relativeScale,
           heightRatio: relativeScale,
@@ -320,6 +356,165 @@
     globalThis.requestAnimationFrame?.(() => globalThis.requestAnimationFrame?.(restore));
   }
 
+  function previewAutoFitLimits(type, popup = null) {
+    const bounds = viewportBounds();
+    const relativeScale = RELATIVE_SCALE_TYPES.has(type) ? relativeScaleFor(type) : 1;
+    // Long, genuinely single-line equations are allowed substantially more
+    // horizontal room. All other environment previews retain the normal 40%
+    // viewport cap. The slider scales both limits in exactly the same way.
+    const wideSingleLineEquation = Boolean(
+      type === "equation" &&
+      popup?.dataset?.smarttexEquationSingleLine === "true"
+    );
+    const widthFraction = wideSingleLineEquation ? 0.8 : 0.4;
+    // Figures are height-dominated far more often than equations/tables. A
+    // fixed 40%-of-viewport height cap made tall figures acquire scrollbars
+    // even when the complete media + caption would comfortably fit on screen.
+    // Keep the historical 40% target for equations/tables, but let figure
+    // previews grow vertically to the full usable viewport before zooming.
+    const heightLimit = type === "image"
+      ? bounds.height
+      : Math.min(bounds.height, Math.max(1, window.innerHeight * 0.4 * relativeScale));
+    return {
+      width: Math.min(
+        bounds.width,
+        Math.max(1, window.innerWidth * widthFraction * relativeScale)
+      ),
+      height: heightLimit,
+      relativeScale,
+      widthFraction
+    };
+  }
+
+  function prepareForReveal(popup, state, { rebase = false } = {}) {
+    if (!state || popup.hidden) return false;
+    const type = state.type;
+    state.restoreToken += 1;
+    if (rebase) {
+      clearSize(popup);
+      delete state.naturalSizes[type];
+    }
+
+    let naturalSize = state.naturalSizes[type];
+    if (!naturalSize) {
+      clearSize(popup);
+      const rect = measurableRect(popup);
+      if (!rect) return false;
+      naturalSize = state.naturalSizes[type] = {
+        width: rect.width,
+        height: rect.height
+      };
+    }
+
+    const limits = previewAutoFitLimits(type, popup);
+    const relativeScale = limits.relativeScale;
+    resizePopup(popup, state, type, {
+      left: popup.getBoundingClientRect().left,
+      top: popup.getBoundingClientRect().top,
+      width: naturalSize.width * relativeScale,
+      height: naturalSize.height * relativeScale
+    }, {
+      live: false,
+      persist: false,
+      contentScaleOverride: relativeScale,
+      widthLimit: limits.width,
+      heightLimit: limits.height
+    });
+    popup.dataset.smarttexRelativeSized = "true";
+    popup.dataset.smarttexAutoFitMaxWidth = String(limits.width);
+    popup.dataset.smarttexAutoFitMaxHeight = String(limits.height);
+    return {
+      naturalSize: { ...naturalSize },
+      relativeScale,
+      maxWidth: limits.width,
+      maxHeight: limits.height
+    };
+  }
+
+  function prepareCachedForReveal(popup, state, cached = {}) {
+    if (!state || popup.hidden || !cached?.naturalSize) return false;
+    const type = state.type;
+    state.restoreToken += 1;
+    clearSize(popup);
+    state.naturalSizes[type] = {
+      width: Math.max(1, Number(cached.naturalSize.width) || 1),
+      height: Math.max(1, Number(cached.naturalSize.height) || 1)
+    };
+
+    const limits = previewAutoFitLimits(type, popup);
+    const natural = state.naturalSizes[type];
+    const scaledNaturalWidth = natural.width * limits.relativeScale;
+    const scaledNaturalHeight = natural.height * limits.relativeScale;
+    const hasCompatibleFittedGeometry = Boolean(
+      Number(cached.finalSize?.width) > 0 &&
+      Number(cached.finalSize?.height) > 0 &&
+      Math.abs((Number(cached.relativeScale) || 0) - limits.relativeScale) < 0.001 &&
+      Math.abs((Number(cached.viewportWidth) || 0) - window.innerWidth) <= 2 &&
+      Math.abs((Number(cached.viewportHeight) || 0) - window.innerHeight) <= 2
+    );
+
+    // Fitted cached dimensions are only hints. They can differ subtly from the
+    // current live DOM because of font rasterization, device scale, or a newly
+    // decoded image. Always start from cached *intrinsic* geometry and let the
+    // live fit validator derive the final size exactly as the cold path does.
+    const requestedWidth = scaledNaturalWidth;
+    const requestedHeight = scaledNaturalHeight;
+
+    resizePopup(popup, state, type, {
+      left: popup.getBoundingClientRect().left,
+      top: popup.getBoundingClientRect().top,
+      width: requestedWidth,
+      height: requestedHeight
+    }, {
+      live: false,
+      persist: false,
+      contentScaleOverride: limits.relativeScale,
+      widthLimit: limits.width,
+      heightLimit: limits.height
+    });
+    popup.dataset.smarttexRelativeSized = "true";
+    popup.dataset.smarttexAutoFitMaxWidth = String(limits.width);
+    popup.dataset.smarttexAutoFitMaxHeight = String(limits.height);
+
+    // Background-warmed cache entries intentionally do not store viewport-
+    // specific final sizing. Derive the grow/zoom result directly from the
+    // cached intrinsic geometry so they can still use the no-RAF fast path.
+    const widthFit = Math.min(1, limits.width / Math.max(1, scaledNaturalWidth));
+    const heightFit = Math.min(1, limits.height / Math.max(1, scaledNaturalHeight));
+    const requiredFit = Math.min(1, widthFit, heightFit);
+    const autoFitZoom = Math.max(0.75, requiredFit);
+    const scrollFallback = requiredFit < 0.75;
+
+    return {
+      naturalSize: { ...natural },
+      relativeScale: limits.relativeScale,
+      maxWidth: limits.width,
+      maxHeight: limits.height,
+      cacheCompatible: hasCompatibleFittedGeometry,
+      autoFitZoom,
+      scrollFallback
+    };
+  }
+
+  function growForContent(popup, state, requested = {}) {
+    if (!state || popup.hidden) return false;
+    const type = state.type;
+    const limits = previewAutoFitLimits(type, popup);
+    const rect = popup.getBoundingClientRect();
+    return resizePopup(popup, state, type, {
+      left: rect.left,
+      top: rect.top,
+      width: Math.max(rect.width, Number(requested.width) || rect.width),
+      height: Math.max(rect.height, Number(requested.height) || rect.height)
+    }, {
+      live: false,
+      persist: false,
+      contentScaleOverride: limits.relativeScale,
+      widthLimit: Number(requested.maxWidth) > 0 ? Math.min(limits.width, Number(requested.maxWidth)) : limits.width,
+      heightLimit: Number(requested.maxHeight) > 0 ? Math.min(limits.height, Number(requested.maxHeight)) : limits.height
+    });
+  }
+
   function clearSize(popup) {
     popup.style.removeProperty("width");
     popup.style.removeProperty("height");
@@ -328,6 +523,9 @@
     popup.style.removeProperty("--smarttex-popup-content-scale");
     delete popup.dataset.smarttexUserSized;
     delete popup.dataset.smarttexRelativeSized;
+    delete popup.dataset.smarttexTemporarySized;
+    delete popup.dataset.smarttexAutoFitMaxWidth;
+    delete popup.dataset.smarttexAutoFitMaxHeight;
   }
 
   function ensureCloseChrome(popup, state) {
@@ -341,6 +539,7 @@
     );
     if (!heading) return;
     heading.classList.add("smarttex-popup-window-heading-enhanced");
+    ensureMoveHandle(popup, state, heading);
 
     let close = (
       (state.options.closeButton instanceof Element ? state.options.closeButton : null) ||
@@ -381,6 +580,148 @@
     } else if (hint.nextElementSibling !== close) {
       close.before(hint);
     }
+  }
+
+  function restoreTemporaryMove(popup, state) {
+    if (popup.dataset.smarttexTemporaryMoved !== "true") return;
+    const original = state.preDragPosition || {};
+    if (original.left) popup.style.left = original.left;
+    else popup.style.removeProperty("left");
+    if (original.top) popup.style.top = original.top;
+    else popup.style.removeProperty("top");
+    state.preDragPosition = null;
+    delete popup.dataset.smarttexTemporaryMoved;
+  }
+
+  function startMove(event, popup, state, headingOverride = null) {
+    if (event.button !== 0 || popup.hidden) return;
+    if (event.target?.closest?.("button, a, input, textarea, select, [contenteditable='true']")) return;
+    event.preventDefault();
+    event.stopPropagation();
+
+    // The heading can be replaced while a preview is re-rendered. Accept an
+    // explicitly resolved live heading so delegated popup handling keeps drag
+    // behavior working even after such DOM replacement.
+    const heading = headingOverride || event.currentTarget;
+    const rect = popup.getBoundingClientRect();
+    const bounds = viewportBounds();
+    if (popup.dataset.smarttexTemporaryMoved !== "true") {
+      state.preDragPosition = {
+        left: popup.style.left,
+        top: popup.style.top
+      };
+    }
+    const origin = {
+      pointerX: event.clientX,
+      pointerY: event.clientY,
+      left: rect.left,
+      top: rect.top,
+      width: rect.width,
+      height: rect.height
+    };
+    popup.classList.add("smarttex-popup-moving");
+    popup.dataset.smarttexTemporaryMoved = "true";
+    // Keep the direct cursor declaration in sync with the drag state. The
+    // inline rule is intentional (see markMoveHandle) because host CSS can be
+    // more specific than extension styles.
+    heading.style.setProperty("cursor", "grabbing", "important");
+
+    const pointerId = event.pointerId;
+    try {
+      heading.setPointerCapture?.(pointerId);
+    } catch (_error) {
+      // Synthetic test pointers may not be capturable.
+    }
+
+    const move = (moveEvent) => {
+      if (moveEvent.pointerId !== pointerId) return;
+      moveEvent.preventDefault();
+      const left = Math.max(
+        bounds.margin,
+        Math.min(
+          origin.left + moveEvent.clientX - origin.pointerX,
+          window.innerWidth - bounds.margin - origin.width
+        )
+      );
+      const top = Math.max(
+        bounds.margin,
+        Math.min(
+          origin.top + moveEvent.clientY - origin.pointerY,
+          window.innerHeight - bounds.margin - origin.height
+        )
+      );
+      popup.style.left = `${Math.round(left)}px`;
+      popup.style.top = `${Math.round(top)}px`;
+    };
+
+    const finish = (finishEvent) => {
+      if (
+        finishEvent?.type !== "blur" &&
+        finishEvent?.pointerId !== undefined &&
+        finishEvent.pointerId !== pointerId
+      ) return;
+      window.removeEventListener("pointermove", move, true);
+      window.removeEventListener("pointerup", finish, true);
+      window.removeEventListener("pointercancel", finish, true);
+      window.removeEventListener("blur", finish, true);
+      try {
+        if (heading.hasPointerCapture?.(pointerId)) heading.releasePointerCapture(pointerId);
+      } catch (_error) {
+        // The pointer may already have been released by the browser.
+      }
+      popup.classList.remove("smarttex-popup-moving");
+      heading.style.setProperty("cursor", "grab", "important");
+    };
+
+    window.addEventListener("pointermove", move, { capture: true, passive: false });
+    window.addEventListener("pointerup", finish, true);
+    window.addEventListener("pointercancel", finish, true);
+    window.addEventListener("blur", finish, true);
+  }
+
+  function markMoveHandle(heading) {
+    if (!(heading instanceof Element)) return;
+    heading.classList.add("smarttex-popup-move-handle");
+    heading.dataset.smarttexPopupMoveHandle = "true";
+
+    // Set the cursor on the live header itself as well as through CSS. Some
+    // CollabTeX/extension style combinations replace or outrank inherited
+    // cursor rules while a popup is being rerendered. The inline important
+    // declaration makes the user-visible hand cursor deterministic without
+    // changing any interactive child controls such as the Close button.
+    // The main editor preview intentionally keeps pointer-events disabled on
+    // the outer popup while selectively re-enabling interactive descendants.
+    // The header must explicitly opt back in as well; otherwise it is skipped
+    // during hit testing, so neither the grab cursor nor pointerdown drag logic
+    // can ever run even though the drag handler itself is correctly installed.
+    heading.style.setProperty("pointer-events", "auto", "important");
+    heading.style.setProperty("cursor", "grab", "important");
+    heading.style.setProperty("user-select", "none", "important");
+    heading.style.setProperty("touch-action", "none", "important");
+  }
+
+  function ensureMoveHandle(popup, state, heading) {
+    if (!heading) return;
+    markMoveHandle(heading);
+
+    // Use delegated capture-phase handling on the popup. Renderer code or host
+    // UI handlers may replace the heading or stop bubbling pointer events; a
+    // capture listener sees the press before those handlers and resolves the
+    // *current* heading node each time. This keeps header dragging functional
+    // after figure/table/equation rerenders instead of depending on a stale DOM
+    // node that happened to exist when the popup was first enhanced.
+    if (popup.dataset.smarttexPopupMoveDelegated === "true") return;
+    popup.dataset.smarttexPopupMoveDelegated = "true";
+    popup.addEventListener("pointerdown", (event) => {
+      const liveHeading = event.target?.closest?.(
+        ".smarttex-popup-move-handle, .smarttex-preview-heading, .smarttex-citation-header, " +
+        ".smarttex-reference-autocomplete-header, .smarttex-figure-autocomplete-header, " +
+        ".smarttex-reference-popup-heading, .smarttex-popup-window-heading"
+      );
+      if (!liveHeading || !popup.contains(liveHeading)) return;
+      markMoveHandle(liveHeading);
+      startMove(event, popup, state, liveHeading);
+    }, { capture: true, passive: false });
   }
 
   function ensureResizeHandles(popup, state) {
@@ -488,7 +829,8 @@
         top: finalRect.top,
         width: finalRect.width,
         height: finalRect.height
-      }, { live: false, persist: true });
+      }, { live: false, persist: false });
+      popup.dataset.smarttexTemporarySized = "true";
     };
 
     window.addEventListener("pointermove", move, { capture: true, passive: false });
@@ -512,7 +854,13 @@
       };
       states.set(popup, state);
       state.visibilityObserver = new MutationObserver(() => {
-        if (!popup.hidden) scheduleSavedSize(popup, state, state.type);
+        if (popup.hidden) {
+          if (popup.dataset.smarttexTemporarySized === "true") clearSize(popup);
+          restoreTemporaryMove(popup, state);
+          return;
+        }
+        if (popup.dataset.smarttexStaging === "true") return;
+        scheduleSavedSize(popup, state, state.type);
       });
       state.visibilityObserver.observe(popup, {
         attributes: true,
@@ -538,8 +886,7 @@
         if (!firstType && switchedType && !popup.hidden) state.restoreAfterContent = true;
         else scheduleSavedSize(popup, state, type);
       } else if (
-        sizes[type] &&
-        (popup.dataset.smarttexUserSized !== "true" || !popup.style.width || !popup.style.height)
+        popup.dataset.smarttexUserSized !== "true" || !popup.style.width || !popup.style.height
       ) {
         scheduleSavedSize(popup, state, type);
       }
@@ -550,7 +897,7 @@
     return {
       setType,
       refresh: ({ rebase = false } = {}) => {
-        if (rebase && sizes[state.type]) {
+        if (rebase) {
           clearSize(popup);
           delete state.naturalSizes[state.type];
         }
@@ -558,6 +905,39 @@
         scheduleSavedSize(popup, state, state.type);
         ensureCloseChrome(popup, state);
         ensureResizeHandles(popup, state);
+      },
+      resetForMeasurement: () => {
+        // A staged preview must start from an unscaled outer popup. Otherwise a
+        // figure/table can fit itself to the previous opening's slider-scaled
+        // geometry and that already-shrunken inner layout becomes the next
+        // measured default, causing cumulative shrink on repeated openings.
+        state.restoreToken += 1;
+        state.restoreAfterContent = false;
+        clearSize(popup);
+        delete state.naturalSizes[state.type];
+        ensureCloseChrome(popup, state);
+        ensureResizeHandles(popup, state);
+        return true;
+      },
+      prepareForReveal: ({ rebase = false } = {}) => {
+        state.restoreAfterContent = false;
+        const prepared = prepareForReveal(popup, state, { rebase });
+        ensureCloseChrome(popup, state);
+        ensureResizeHandles(popup, state);
+        return prepared;
+      },
+      prepareCachedForReveal: (cached = {}) => {
+        state.restoreAfterContent = false;
+        const prepared = prepareCachedForReveal(popup, state, cached);
+        ensureCloseChrome(popup, state);
+        ensureResizeHandles(popup, state);
+        return prepared;
+      },
+      growForContent: (requested = {}) => {
+        const grown = growForContent(popup, state, requested);
+        ensureCloseChrome(popup, state);
+        ensureResizeHandles(popup, state);
+        return grown;
       }
     };
   }
@@ -565,7 +945,13 @@
   function fitToViewport(popup) {
     const state = states.get(popup);
     if (!state || popup.dataset.smarttexUserSized !== "true") return;
-    applySize(popup, state, state.type, sizes[state.type]);
+    const rect = popup.getBoundingClientRect();
+    resizePopup(popup, state, state.type, {
+      left: rect.left,
+      top: rect.top,
+      width: rect.width,
+      height: rect.height
+    }, { live: false, persist: false });
   }
 
   function rebaseOpenPopups({ reset = false } = {}) {
@@ -592,23 +978,20 @@
     relativeSettings = normalizeRelativeSettings(nextSettings);
     writeRelativeSettings();
 
-    // The sliders write the same width/height ratios that are produced by manual
-    // popup resizing. A selected percentage therefore always means that fraction
-    // of the popup's measured default width and default height.
-    for (const type of RELATIVE_SCALE_TYPES) {
-      const ratio = relativeScaleFor(type);
-      sizes[type] = { widthRatio: ratio, heightRatio: ratio, scale: ratio };
-    }
-    writeSizes();
-
+    // The sliders are the only persistent popup-size setting. Their percentages
+    // are applied to the popup's measured default width and height. Manual edge
+    // dragging never writes this setting and is temporary to the current popup.
     document.querySelectorAll(".smarttex-popup-resizable").forEach((popup) => {
       const state = states.get(popup);
       if (!state || !RELATIVE_SCALE_TYPES.has(state.type)) return;
       state.restoreToken += 1;
       if (popup.hidden) return;
 
-      if (state.naturalSizes[state.type]) {
-        applySize(popup, state, state.type, sizes[state.type], { live: false, persist: true });
+      const naturalSize = state.naturalSizes[state.type];
+      if (naturalSize) {
+        prepareForReveal(popup, state, { rebase: false });
+        delete popup.dataset.smarttexTemporarySized;
+        popup.dataset.smarttexRelativeSized = "true";
         return;
       }
 

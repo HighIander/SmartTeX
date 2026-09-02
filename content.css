@@ -132,6 +132,37 @@
   transition: none;
 }
 
+/* Opening previews are fully rendered and measured while mounted but invisible.
+   This prevents users from seeing the temporary empty/narrow geometry. */
+#smarttex-equation-preview.smarttex-preview-staging {
+  visibility: hidden !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
+  transition: none !important;
+}
+
+/* Intrinsic measurement deliberately removes normal viewport caps while the
+   popup is invisible. The final popup is capped only after this measurement. */
+#smarttex-equation-preview.smarttex-preview-intrinsic-measure {
+  width: max-content !important;
+  height: max-content !important;
+  max-width: none !important;
+  max-height: none !important;
+}
+
+#smarttex-equation-preview.smarttex-preview-intrinsic-measure .smarttex-equation-output {
+  width: max-content !important;
+  height: max-content !important;
+  max-width: none !important;
+  max-height: none !important;
+  overflow: visible !important;
+}
+
+/* Scrollbars are the final fallback only after growth and >=75% auto-fit zoom. */
+#smarttex-equation-preview.smarttex-preview-scroll-fallback .smarttex-equation-output {
+  overflow: auto !important;
+}
+
 #smarttex-equation-preview[data-placement="above"] {
   transform-origin: center bottom;
 }
@@ -188,9 +219,22 @@
   pointer-events: auto;
   max-width: min(56vw, calc(100vw - 26px));
   max-height: min(62vh, 560px);
-  overflow: auto;
+  overflow: hidden;
   padding: 17px 20px;
   text-align: center;
+}
+
+/* Equation previews never introduce artificial wrapping. The popup gate owns
+   the horizontal cap: 80% × slider for a rendered one-liner, otherwise the
+   normal 40% × slider cap. Overflow is handled only by grow/zoom/scroll. */
+#smarttex-equation-preview[data-preview-kind="equation"] .smarttex-equation-output {
+  max-width: none;
+  white-space: nowrap;
+}
+
+#smarttex-equation-preview[data-preview-kind="equation"] .smarttex-equation-output > .katex-display,
+#smarttex-equation-preview[data-preview-kind="equation"] .smarttex-equation-output .katex {
+  white-space: nowrap;
 }
 
 .smarttex-equation-output > .katex-display {
@@ -355,6 +399,25 @@
   width: max-content;
   max-width: 100%;
   margin: 0;
+}
+
+/* Main environment previews keep inner content non-scrolling while the staged
+   grow/zoom policy is still trying to fit the content. The outer output becomes
+   scrollable only as the final fallback. */
+#smarttex-equation-preview .smarttex-table-scroll {
+  max-width: none;
+  overflow: visible;
+}
+
+#smarttex-equation-preview .smarttex-float-popup-caption {
+  max-height: none;
+  overflow: visible;
+  scrollbar-gutter: auto;
+}
+
+#smarttex-equation-preview.smarttex-preview-scroll-fallback .smarttex-table-scroll,
+#smarttex-equation-preview.smarttex-preview-scroll-fallback .smarttex-float-popup-caption {
+  overflow: visible;
 }
 
 .smarttex-table-preview {
@@ -4168,6 +4231,18 @@ html.smarttex-editor-scrolling .smarttex-popup-loading-spinner {
   pointer-events: none !important;
 }
 
+/* Freeze all SmartTeX source decoration while keys are being delivered. The
+   layers remain mounted, but are removed from painting until one consolidated
+   state/geometry refresh runs 500 ms after the final keyboard input. */
+html[data-smarttex-editor-typing="true"] #smarttex-source-structure-highlights,
+html[data-smarttex-editor-typing="true"] #smarttex-source-number-badges,
+html[data-smarttex-editor-typing="true"] #smarttex-comment-highlights,
+html[data-smarttex-editor-typing="true"] #smarttex-comment-icons,
+html[data-smarttex-editor-typing="true"] #smarttex-comment-selection-popup {
+  visibility: hidden !important;
+  pointer-events: none !important;
+}
+
 .smarttex-label-guard-preview-secondary {
   color: #526174;
   font-size: 0.95em;
@@ -4541,6 +4616,27 @@ html.smarttex-editor-scrolling .smarttex-popup-loading-spinner {
   font: 600 11px/1.25 Inter, ui-sans-serif, system-ui, sans-serif;
 }
 
+.smarttex-settings-popup-caption-scale {
+  display: grid;
+  grid-template-columns: 92px minmax(0, 1fr) 42px;
+  align-items: center;
+  gap: 7px;
+  margin-top: 8px;
+  padding: 7px 8px;
+  border: 1px solid #d9e0e8;
+  border-radius: 7px;
+  color: #344054;
+  background: #f8fafc;
+  font: 600 11px/1.25 Inter, ui-sans-serif, system-ui, sans-serif;
+}
+
+.smarttex-settings-popup-caption-scale input[type="range"] {
+  width: 100%;
+  min-width: 0;
+  margin: 0;
+  accent-color: #1674d1;
+}
+
 @media (max-width: 520px) {
   .smarttex-settings-row-select,
   .smarttex-settings-row-range {
@@ -4618,8 +4714,14 @@ html.smarttex-editor-scrolling .smarttex-popup-loading-spinner {
     color: #79c0ff;
   }
   .smarttex-settings-popup-scale-toggle,
-  .smarttex-settings-popup-separate-scales {
+  .smarttex-settings-popup-separate-scales,
+  .smarttex-settings-popup-caption-scale {
     border-color: #53647a;
+  }
+
+  .smarttex-settings-popup-caption-scale {
+    color: #d7e1ee;
+    background: #202b3b;
   }
 
   .smarttex-settings-popup-scale-toggle {
@@ -5002,15 +5104,15 @@ html[data-smarttex-popup-resize-direction="se"] * { cursor: nwse-resize !importa
 }
 
 [data-smarttex-popup-type="image"] .smarttex-figure-popup {
-  gap: calc(9px * var(--smarttex-popup-content-scale, 1));
+  gap: calc(9px * var(--smarttex-popup-effective-scale, var(--smarttex-popup-content-scale, 1)));
 }
 
 [data-smarttex-popup-type="image"] .smarttex-float-popup-caption {
-  font-size: calc(12px * var(--smarttex-popup-content-scale, 1));
+  font-size: calc(12px * var(--smarttex-popup-effective-scale, var(--smarttex-popup-content-scale, 1)));
 }
 
 #smarttex-equation-preview[data-smarttex-popup-type="table"] .smarttex-table-popup {
-  gap: calc(9px * var(--smarttex-popup-content-scale, 1));
+  gap: calc(9px * var(--smarttex-popup-effective-scale, var(--smarttex-popup-content-scale, 1)));
 }
 
 #smarttex-equation-preview[data-smarttex-popup-type="table"] .smarttex-table-preview {
@@ -7438,4 +7540,584 @@ html[data-theme="dark"] #smarttex-review-stop-overlay .smarttex-comments-confirm
 .smarttex-fallback-name-notice-close:focus-visible {
   opacity: 1;
   background: rgba(127, 127, 127, 0.12);
+}
+
+/* A resized popup owns the available caption width. The rendered figure/table
+   may stay narrower to preserve its intrinsic aspect ratio/content width, while
+   the caption uses the complete popup content width. */
+#smarttex-equation-preview[data-smarttex-user-sized="true"][data-preview-kind="figure"] .smarttex-equation-output,
+#smarttex-equation-preview[data-smarttex-user-sized="true"][data-preview-kind="table"] .smarttex-equation-output {
+  box-sizing: border-box;
+  width: 100%;
+}
+
+#smarttex-equation-preview[data-smarttex-user-sized="true"][data-preview-kind="figure"] .smarttex-figure-popup,
+#smarttex-equation-preview[data-smarttex-user-sized="true"][data-preview-kind="table"] .smarttex-table-popup,
+.smarttex-document-reference-popup[data-smarttex-user-sized="true"] .smarttex-figure-popup,
+.smarttex-document-reference-popup[data-smarttex-user-sized="true"] .smarttex-table-popup,
+.smarttex-editor-reference-popup[data-smarttex-user-sized="true"] .smarttex-figure-popup,
+.smarttex-editor-reference-popup[data-smarttex-user-sized="true"] .smarttex-table-popup {
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+}
+
+#smarttex-equation-preview[data-smarttex-user-sized="true"] .smarttex-float-popup-caption,
+.smarttex-document-reference-popup[data-smarttex-user-sized="true"] .smarttex-float-popup-caption,
+.smarttex-editor-reference-popup[data-smarttex-user-sized="true"] .smarttex-float-popup-caption {
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  justify-self: stretch;
+}
+
+/* Popup headers are drag handles for temporary popup positioning.
+   Target both the enhanced class and the native header selectors so the hand
+   cursor is present immediately even if a renderer replaces the heading DOM. */
+.smarttex-popup-move-handle,
+.smarttex-popup-resizable > .smarttex-preview-heading,
+.smarttex-popup-resizable > .smarttex-citation-header,
+.smarttex-popup-resizable > .smarttex-reference-autocomplete-header,
+.smarttex-popup-resizable > .smarttex-figure-autocomplete-header,
+.smarttex-popup-resizable > .smarttex-reference-popup-heading,
+.smarttex-popup-resizable > .smarttex-popup-window-heading {
+  /* The outer editor popup uses pointer-events:none while staged/managed;
+     explicitly re-enable hit testing on the visible header so it can serve as
+     the move handle instead of letting pointer events fall through to the
+     editor underneath. */
+  pointer-events: auto !important;
+  cursor: grab !important;
+  user-select: none;
+  touch-action: none;
+}
+
+.smarttex-popup-moving .smarttex-popup-move-handle,
+.smarttex-popup-moving > .smarttex-preview-heading,
+.smarttex-popup-moving > .smarttex-citation-header,
+.smarttex-popup-moving > .smarttex-reference-autocomplete-header,
+.smarttex-popup-moving > .smarttex-figure-autocomplete-header,
+.smarttex-popup-moving > .smarttex-reference-popup-heading,
+.smarttex-popup-moving > .smarttex-popup-window-heading {
+  cursor: grabbing !important;
+}
+
+.smarttex-popup-move-handle button,
+.smarttex-popup-move-handle a,
+.smarttex-popup-move-handle input,
+.smarttex-popup-move-handle textarea,
+.smarttex-popup-move-handle select,
+.smarttex-popup-move-handle [contenteditable="true"] {
+  cursor: pointer;
+}
+
+/* Included-figure indicator in the CollabTeX file tree. */
+.smarttex-figure-icon-anchor {
+  position: relative !important;
+  overflow: visible !important;
+}
+
+.smarttex-figure-included-badge {
+  position: absolute;
+  z-index: 8;
+  right: -4px;
+  bottom: -4px;
+  display: grid;
+  place-items: center;
+  width: 13px;
+  height: 13px;
+  border: 1.5px solid #fff;
+  border-radius: 50%;
+  color: #fff;
+  background: #1a9b45;
+  font: 800 10px/1 system-ui, sans-serif;
+  box-shadow: 0 0 0 1px rgba(0, 80, 25, 0.18);
+  pointer-events: none;
+}
+
+.smarttex-figure-included > .smarttex-figure-included-badge {
+  left: 20px;
+  right: auto;
+  top: 4px;
+  bottom: auto;
+}
+
+/* Numbered equations, figures, and tables merged into CollabTeX's section hierarchy. */
+.smarttex-numbered-outline-list {
+  margin: 0;
+  padding: 1px 0 2px 16px;
+}
+
+.smarttex-numbered-outline-list[hidden] {
+  display: none !important;
+}
+
+.smarttex-numbered-outline-toggle {
+  position: relative;
+  display: inline-block;
+  flex: 0 0 auto;
+  width: 12px;
+  height: 14px;
+  margin: 0 2px 0 -2px;
+  vertical-align: -2px;
+  cursor: pointer;
+}
+
+.smarttex-numbered-outline-toggle::before {
+  content: "";
+  position: absolute;
+  left: 3px;
+  top: 4px;
+  width: 0;
+  height: 0;
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+  border-left: 5px solid currentColor;
+  opacity: 0.72;
+  transform: rotate(90deg);
+  transform-origin: 2px 4px;
+  transition: transform 100ms ease, opacity 100ms ease;
+}
+
+.smarttex-numbered-outline-toggle:hover::before {
+  opacity: 1;
+}
+
+.smarttex-numbered-outline-toggle.smarttex-numbered-outline-toggle-collapsed::before {
+  transform: rotate(0deg);
+}
+
+.smarttex-numbered-outline-root {
+  padding-left: 2px;
+}
+
+.smarttex-numbered-outline-item {
+  margin: 0;
+  padding: 0;
+}
+
+.smarttex-numbered-outline-link {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: baseline;
+  gap: 4px;
+  width: 100%;
+  min-width: 0;
+  margin: 0;
+  padding: 2px 8px 2px 12px;
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 0.94em;
+  line-height: 1.35;
+  text-align: left;
+  cursor: pointer;
+  user-select: none;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.smarttex-numbered-outline-link.smarttex-numbered-outline-link-active {
+  /* CollabTeX's outline-item-link-highlight class supplies the native current
+     item styling. This fallback keeps the current numbered row obvious if a
+     compatible deployment uses a slightly different outline stylesheet. */
+  background: color-mix(in srgb, currentColor 13%, transparent);
+}
+
+.smarttex-numbered-outline-link:hover,
+.smarttex-numbered-outline-link:focus-visible {
+  background: color-mix(in srgb, currentColor 10%, transparent);
+}
+
+.smarttex-numbered-outline-link:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: -2px;
+}
+
+.smarttex-numbered-outline-number {
+  flex: 0 0 auto;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.smarttex-numbered-outline-separator {
+  flex: 0 0 auto;
+  opacity: 0.72;
+  white-space: nowrap;
+}
+
+.smarttex-numbered-outline-label {
+  min-width: 0;
+  overflow: hidden;
+  color: inherit;
+  opacity: 0.78;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: 0.92em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Lightweight thumbnail previews for numbered outline rows and graphics files. */
+#smarttex-structure-hover-preview,
+#smarttex-structure-hover-preview *,
+#smarttex-structure-hover-preview *::before,
+#smarttex-structure-hover-preview *::after {
+  box-sizing: border-box;
+}
+
+#smarttex-structure-hover-preview[hidden] {
+  display: none !important;
+}
+
+#smarttex-structure-hover-preview {
+  position: fixed;
+  z-index: 2147483646;
+  width: fit-content;
+  min-width: 150px;
+  max-width: min(420px, calc(100vw - 20px));
+  max-height: calc(100vh - 20px);
+  overflow: hidden;
+  border: 1px solid rgb(104 120 140 / 50%);
+  border-radius: 8px;
+  color: #1f2937;
+  background: rgb(255 255 255 / 98%);
+  box-shadow:
+    0 10px 28px rgb(15 23 42 / 22%),
+    0 2px 7px rgb(15 23 42 / 12%);
+  font: 11px/1.35 Inter, ui-sans-serif, system-ui, sans-serif;
+  pointer-events: none;
+}
+
+#smarttex-structure-hover-preview.smarttex-structure-hover-preview-measuring {
+  left: 0 !important;
+  top: 0 !important;
+  visibility: hidden;
+}
+
+.smarttex-structure-hover-content {
+  display: grid;
+  min-width: 0;
+  max-width: 418px;
+  max-height: calc(100vh - 22px);
+}
+
+.smarttex-structure-hover-title {
+  min-width: 0;
+  padding: 5px 8px;
+  overflow: hidden;
+  border-bottom: 1px solid #e1e6ed;
+  color: #526174;
+  background: #f7f9fc;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.smarttex-structure-hover-body {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  min-width: 0;
+  max-width: 418px;
+  max-height: calc(100vh - 58px);
+  padding: 7px;
+  overflow: hidden;
+  overscroll-behavior: contain;
+}
+
+/* Keep captions fully visible. If space is tight, preview media/table content
+   shrinks or scrolls before the caption is ever clipped. */
+.smarttex-structure-hover-body > :not(.smarttex-structure-hover-caption) {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.smarttex-structure-hover-figure .smarttex-structure-hover-figure-layout,
+.smarttex-structure-hover-table .smarttex-table-scroll,
+.smarttex-structure-hover-table .smarttex-table-rendered {
+  overflow: auto;
+}
+
+
+.smarttex-structure-hover-file-body {
+  width: min(310px, 44vw);
+  height: min(220px, 32vh);
+  min-width: 150px;
+  min-height: 90px;
+  overflow: hidden;
+}
+
+.smarttex-structure-hover-image {
+  display: block;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  object-fit: contain;
+}
+
+.smarttex-structure-hover-media-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 4px;
+  width: min(390px, 48vw);
+  height: min(190px, 27vh);
+  min-width: 145px;
+  min-height: 80px;
+  overflow: hidden;
+  border-radius: 4px;
+  background: #f6f8fb;
+}
+
+.smarttex-structure-hover-media-grid > .smarttex-structure-hover-image:only-child {
+  grid-column: 1 / -1;
+  grid-row: 1 / -1;
+}
+
+.smarttex-structure-hover-caption {
+  flex: 0 0 auto;
+  width: 100%;
+  max-width: none;
+  max-height: none;
+  margin-top: 5px;
+  overflow: visible;
+  overflow-wrap: anywhere;
+  color: #526174;
+  font-size: 10.5px;
+  line-height: 1.3;
+}
+
+.smarttex-structure-hover-missing {
+  grid-column: 1 / -1;
+  display: grid;
+  place-items: center;
+  min-height: 80px;
+  color: #7b8795;
+  font-weight: 600;
+}
+
+.smarttex-structure-hover-equation-render {
+  max-width: 310px;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+.smarttex-structure-hover-equation-render .katex-display {
+  width: max-content;
+  min-width: 100%;
+  margin: 2px 0;
+}
+
+.smarttex-structure-hover-equation-render .katex {
+  font-size: 0.92em;
+}
+
+#smarttex-structure-hover-preview .smarttex-table-scroll,
+#smarttex-structure-hover-preview .smarttex-table-rendered,
+#smarttex-structure-hover-preview table {
+  max-width: 310px;
+}
+
+#smarttex-structure-hover-preview .smarttex-table-scroll {
+  max-height: 210px;
+  overflow: auto;
+}
+
+body.smarttex-dark-mode #smarttex-structure-hover-preview,
+html[data-theme="dark"] #smarttex-structure-hover-preview,
+body[data-theme="dark"] #smarttex-structure-hover-preview {
+  border-color: rgb(130 151 176 / 48%);
+  color: #d9e3ee;
+  background: rgb(24 34 48 / 98%);
+  box-shadow:
+    0 10px 28px rgb(0 0 0 / 42%),
+    0 2px 7px rgb(0 0 0 / 28%);
+}
+
+body.smarttex-dark-mode #smarttex-structure-hover-preview .smarttex-structure-hover-title,
+html[data-theme="dark"] #smarttex-structure-hover-preview .smarttex-structure-hover-title,
+body[data-theme="dark"] #smarttex-structure-hover-preview .smarttex-structure-hover-title {
+  border-bottom-color: rgb(130 151 176 / 28%);
+  color: #b9c8d8;
+  background: rgb(35 48 65 / 96%);
+}
+
+body.smarttex-dark-mode #smarttex-structure-hover-preview .smarttex-structure-hover-media-grid,
+html[data-theme="dark"] #smarttex-structure-hover-preview .smarttex-structure-hover-media-grid,
+body[data-theme="dark"] #smarttex-structure-hover-preview .smarttex-structure-hover-media-grid {
+  background: #1d2938;
+}
+
+body.smarttex-dark-mode #smarttex-structure-hover-preview .smarttex-structure-hover-caption,
+html[data-theme="dark"] #smarttex-structure-hover-preview .smarttex-structure-hover-caption,
+body[data-theme="dark"] #smarttex-structure-hover-preview .smarttex-structure-hover-caption,
+body.smarttex-dark-mode #smarttex-structure-hover-preview .smarttex-structure-hover-missing,
+html[data-theme="dark"] #smarttex-structure-hover-preview .smarttex-structure-hover-missing,
+body[data-theme="dark"] #smarttex-structure-hover-preview .smarttex-structure-hover-missing {
+  color: #aebdcd;
+}
+
+/* Preserve the parsed figure row/panel layout in small outline hover previews.
+   Images inside one panel stay vertically stacked; separate panels in the
+   same parsed row remain side-by-side. */
+.smarttex-structure-hover-figure-layout {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: min(390px, 48vw);
+  min-width: 145px;
+}
+
+.smarttex-structure-hover-figure-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 4px;
+  width: 100%;
+  min-width: 0;
+}
+
+.smarttex-structure-hover-figure-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.smarttex-structure-hover-figure-image-slot {
+  display: grid;
+  place-items: center;
+  width: 100%;
+  min-width: 0;
+  min-height: 42px;
+  overflow: hidden;
+  border-radius: 3px;
+  background: #f6f8fb;
+}
+
+.smarttex-structure-hover-figure-image-slot > .smarttex-structure-hover-image {
+  width: 100%;
+  height: auto;
+  max-height: 130px;
+  object-fit: contain;
+}
+
+.smarttex-structure-hover-loading-spinner {
+  z-index: 2147483647;
+}
+
+/* 2.1.31: The editor figure itself remains intrinsically tall enough for
+   media + full caption. The outer popup fitter grows the window first and only
+   then applies its >=75% automatic fit. Do not make the media viewport consume
+   a fixed 1fr row: that cropped the image whenever the caption became taller. */
+#smarttex-equation-preview[data-smarttex-user-sized="true"][data-preview-kind="figure"]
+  .smarttex-equation-output {
+  display: block;
+  min-height: 0;
+  overflow: hidden !important;
+}
+
+#smarttex-equation-preview[data-smarttex-user-sized="true"][data-preview-kind="figure"]
+  .smarttex-figure-popup {
+  display: grid;
+  grid-template-rows: auto auto;
+  align-items: start;
+  justify-items: stretch;
+  width: 100% !important;
+  min-width: 0;
+  max-width: 100% !important;
+  height: max-content;
+  max-height: none;
+}
+
+#smarttex-equation-preview[data-smarttex-user-sized="true"][data-preview-kind="figure"]
+  .smarttex-figure-popup-viewport {
+  align-self: start;
+  justify-self: center;
+  min-height: 0;
+  max-height: none;
+  overflow: hidden;
+}
+
+#smarttex-equation-preview[data-smarttex-user-sized="true"][data-preview-kind="figure"]
+  .smarttex-float-popup-caption {
+  align-self: start;
+  justify-self: stretch;
+  width: 100%;
+  min-height: min-content;
+  max-height: none;
+  overflow: visible;
+}
+
+/* Scrollbars remain the final fallback of the outer grow -> >=75% zoom
+   policy. Normally the corrected natural-height measurement prevents them. */
+#smarttex-equation-preview[data-smarttex-user-sized="true"][data-preview-kind="figure"].smarttex-preview-scroll-fallback
+  .smarttex-equation-output {
+  overflow: auto !important;
+}
+
+/* Keep resize hit zones almost entirely on the border. The popup clips the
+   outside portion, leaving only about two CSS pixels over the content area so
+   a native scrollbar remains usable. */
+.smarttex-popup-resize-handle[data-direction="n"],
+.smarttex-popup-resize-handle[data-direction="s"] {
+  right: 7px;
+  left: 7px;
+  height: 6px;
+}
+.smarttex-popup-resize-handle[data-direction="n"] { top: -4px; }
+.smarttex-popup-resize-handle[data-direction="s"] { bottom: -4px; }
+
+.smarttex-popup-resize-handle[data-direction="e"],
+.smarttex-popup-resize-handle[data-direction="w"] {
+  top: 7px;
+  bottom: 7px;
+  width: 6px;
+}
+.smarttex-popup-resize-handle[data-direction="e"] { right: -4px; }
+.smarttex-popup-resize-handle[data-direction="w"] { left: -4px; }
+
+.smarttex-popup-resize-handle[data-direction="ne"],
+.smarttex-popup-resize-handle[data-direction="se"],
+.smarttex-popup-resize-handle[data-direction="sw"],
+.smarttex-popup-resize-handle[data-direction="nw"] {
+  width: 10px;
+  height: 10px;
+}
+.smarttex-popup-resize-handle[data-direction="ne"] { top: -5px; right: -5px; }
+.smarttex-popup-resize-handle[data-direction="se"] { right: -5px; bottom: -5px; }
+.smarttex-popup-resize-handle[data-direction="sw"] { bottom: -5px; left: -5px; }
+.smarttex-popup-resize-handle[data-direction="nw"] { top: -5px; left: -5px; }
+
+.smarttex-popup-resize-handle[data-direction="se"]::before {
+  top: 0;
+  left: 0;
+  right: auto;
+  bottom: auto;
+  width: 6px;
+  height: 6px;
+  background:
+    linear-gradient(135deg, transparent 42%, currentColor 43%, currentColor 57%, transparent 58%) right bottom / 6px 6px no-repeat;
+}
+
+#smarttex-equation-preview .smarttex-preview-title {
+  margin-right: auto;
+}
+
+/* Popup captions are UI text, not scalable figure/table media. Keep their
+   typography constant while auto-fit zoom changes the rendered equation,
+   figure, or table. The S-menu caption-font slider writes the CSS variable;
+   11 px is the compact default requested after the temporary 21 px diagnostic
+   size proved about twice too large. Live caption replacement must therefore
+   never inherit the media auto-fit scale or drift in size while typing. */
+#smarttex-equation-preview[data-preview-kind="figure"] .smarttex-float-popup-caption,
+#smarttex-equation-preview[data-preview-kind="table"] .smarttex-float-popup-caption {
+  font-size: var(--smarttex-popup-caption-font-size, 11px) !important;
+  line-height: 1.45 !important;
+}
+#smarttex-equation-preview[data-preview-kind="figure"] .smarttex-float-popup-caption .katex,
+#smarttex-equation-preview[data-preview-kind="table"] .smarttex-float-popup-caption .katex {
+  font-size: 1em !important;
 }

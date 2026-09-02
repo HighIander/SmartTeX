@@ -1872,6 +1872,133 @@
     };
   }
 
+  function splitMathRowsWithOffsets(sourceValue) {
+    const source = String(sourceValue || "");
+    const rows = [];
+    let start = 0;
+    let braceDepth = 0;
+
+    for (let index = 0; index < source.length; index += 1) {
+      if (source[index] === "{" && !isEscaped(source, index)) {
+        braceDepth += 1;
+        continue;
+      }
+      if (source[index] === "}" && !isEscaped(source, index)) {
+        braceDepth = Math.max(0, braceDepth - 1);
+        continue;
+      }
+      if (
+        braceDepth !== 0 ||
+        source[index] !== "\\" ||
+        source[index + 1] !== "\\"
+      ) {
+        continue;
+      }
+
+      rows.push({ source: source.slice(start, index), start, end: index });
+      index += 1;
+      let next = index + 1;
+      if (source[next] === "*") next += 1;
+      while (next < source.length && /[ \t]/.test(source[next])) next += 1;
+      if (source[next] === "[") {
+        const spacing = readBalanced(source, next, "[", "]");
+        if (spacing) next = spacing.end;
+      }
+      start = next;
+      index = next - 1;
+    }
+    rows.push({ source: source.slice(start), start, end: source.length });
+    return rows;
+  }
+
+  function labelsInSourceRange(sourceValue, maskedValue, startValue, endValue) {
+    const source = String(sourceValue || "");
+    const masked = String(maskedValue || maskIgnoredLatex(source));
+    const start = Math.max(0, Math.min(Number(startValue) || 0, source.length));
+    const end = Math.max(start, Math.min(Number(endValue) || 0, source.length));
+    const segment = masked.slice(start, end);
+    const pattern = /\\label\s*\{([^{}]+)\}/g;
+    const labels = [];
+    let match;
+    while ((match = pattern.exec(segment))) {
+      taskCheckpoint(pattern.lastIndex, 32);
+      const label = String(match[1] || "").trim();
+      if (!label) continue;
+      labels.push({
+        label,
+        sourceIndex: start + match.index
+      });
+    }
+    return labels;
+  }
+
+  function numberedOutlineElements(sourceValue) {
+    const source = String(sourceValue || "");
+    if (!source) return [];
+    const masked = maskIgnoredLatex(source);
+    const analysis = documentCounterAnalysis(source);
+    const elements = [];
+
+    for (const context of analysis.equations || []) {
+      const numbering = analysis.equationNumberingByOpenStart.get(context.openStart);
+      if (!numbering?.numbers?.length) continue;
+      const body = source.slice(context.contentStart, context.contentEnd);
+      const rows = splitMathRowsWithOffsets(body);
+      numbering.numbers.forEach((number, rowIndex) => {
+        if (!number?.value) return;
+        const row = rows[rowIndex] || rows[rows.length - 1] || {
+          start: 0,
+          end: body.length,
+          source: body
+        };
+        const rowStart = context.contentStart + row.start;
+        const rowEnd = context.contentStart + row.end;
+        const labels = labelsInSourceRange(source, masked, rowStart, rowEnd);
+        elements.push({
+          type: "equation",
+          number: String(number.value),
+          label: labels[0]?.label || "",
+          sourceIndex: rowStart,
+          environmentSourceIndex: context.openStart
+        });
+      });
+    }
+
+    for (const context of analysis.figures || []) {
+      const number = analysis.figureNumbersByOpenStart.get(context.openStart);
+      if (number === undefined || number === null || String(number) === "") continue;
+      const labels = labelsInSourceRange(source, masked, context.openStart, context.closeEnd);
+      const caption = floatCaption(source, context, "figure");
+      elements.push({
+        type: "figure",
+        number: String(number),
+        label: labels[0]?.label || "",
+        sourceIndex: context.openStart,
+        caption: caption?.text || "",
+        captionSourceIndex: Number.isFinite(Number(caption?.start)) ? Number(caption.start) : null
+      });
+    }
+
+    for (const context of analysis.tables || []) {
+      const number = analysis.tableNumbersByOpenStart.get(context.openStart);
+      if (number === undefined || number === null || String(number) === "") continue;
+      const labels = labelsInSourceRange(source, masked, context.openStart, context.closeEnd);
+      const caption = floatCaption(source, context, "table");
+      elements.push({
+        type: "table",
+        number: String(number),
+        label: labels[0]?.label || "",
+        sourceIndex: context.openStart,
+        caption: caption?.text || "",
+        captionSourceIndex: Number.isFinite(Number(caption?.start)) ? Number(caption.start) : null
+      });
+    }
+
+    return elements.sort((left, right) => (
+      Number(left.sourceIndex || 0) - Number(right.sourceIndex || 0)
+    ));
+  }
+
   function equationNumberLatex(number) {
     if (!number?.value) return "";
     return number.starred
@@ -1950,6 +2077,7 @@
     figurePreviewNumber,
     floatCaption,
     sectionNumbering,
-    referenceTarget
+    referenceTarget,
+    numberedOutlineElements
   });
 })(globalThis);

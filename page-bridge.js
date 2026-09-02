@@ -68,6 +68,11 @@
   let editor = null;
   let boundSession = null;
   let scheduledState = false;
+  let stateTimer = 0;
+  let stateScheduleRevision = 0;
+  let pointerStateFrame = 0;
+  let pointerStateRevision = 0;
+  let pointerSelectionActive = false;
   let lastFingerprint = "";
   let codeMirrorCleanup = null;
   let citationAutocompleteActive = false;
@@ -129,6 +134,8 @@
   let structureRefreshTimer = 0;
   let overlayFramePending = false;
   let overlayFrameId = 0;
+  let overlayIdleTimer = 0;
+  let editorDiscoveryTimer = 0;
   let structureAnalysisActive =
     document.documentElement.dataset.smarttexStructureAnalysis === "pending";
   const interactionTasks = globalThis.SmartTeXInteractionTasks;
@@ -146,6 +153,10 @@
 
   function taskCheckpoint(iteration = 0, interval = 128) {
     interactionTasks?.checkpoint?.(iteration, interval);
+  }
+
+  function keyboardIdleDelay() {
+    return Math.max(0, Number(interactionTasks?.keyboardIdleRemaining?.()) || 0);
   }
 
   function setStructureAnalysisState(active) {
@@ -729,6 +740,7 @@
   }
 
   function renderSourceNumberBadges(state = lastEditorState) {
+    if (keyboardIdleDelay() > 0) return false;
     const layer = ensureNumberBadgeLayer();
     const highlightLayer = ensureStructureHighlightLayer();
     if (!state || !editor || !highlightLayer) return false;
@@ -920,6 +932,7 @@
       element.style.cssText = ["position:absolute", "right:16px", `top:${Math.round(top - bounds.top - 1)}px`, "padding:1px 4px", "border-radius:3px", "background:rgba(255,255,255,.72)", "color:#7b8493", "white-space:nowrap", "font-variant-numeric:tabular-nums"].join(";");
       badgeFragment.appendChild(element);
     }
+
     taskCheckpoint(0, 1);
     highlightLayer.replaceChildren(highlightFragment);
     layer.replaceChildren(badgeFragment);
@@ -1201,6 +1214,15 @@
   }
 
   function scheduleOverlayRender() {
+    const idleDelay = keyboardIdleDelay();
+    if (idleDelay > 0) {
+      if (overlayIdleTimer) return;
+      overlayIdleTimer = window.setTimeout(() => {
+        overlayIdleTimer = 0;
+        scheduleOverlayRender();
+      }, idleDelay);
+      return;
+    }
     if (overlayFramePending) return;
     overlayFramePending = true;
     overlayFrameId = window.requestAnimationFrame(() => {
@@ -1260,7 +1282,12 @@
   // the cached geometry whenever such an overlay opens or closes so the source
   // colour is restored immediately after the overlay disappears.
   const overlayOcclusionObserver = new MutationObserver((mutations) => {
-    if (mutations.some(occludingOverlayMutation)) scheduleOverlayRender();
+    if (!mutations.some(occludingOverlayMutation)) return;
+    if (keyboardIdleDelay() > 0) {
+      scheduleOverlayRender();
+      return;
+    }
+    scheduleOverlayRender();
   });
   overlayOcclusionObserver.observe(document.documentElement, {
     subtree: true,
@@ -1279,6 +1306,11 @@
       structureRefreshTimer = 0;
       if (!lastEditorState) return;
       const sourceAtStart = lastEditorState.value;
+      if (interactionTasks?.canRunLongTask &&
+          !interactionTasks.canRunLongTask(lastEditorState, sourceAtStart.length)) {
+        setStructureAnalysisState(false);
+        return;
+      }
       let readyForOverlayPaint = false;
       setStructureAnalysisState(true);
       try {
@@ -1314,23 +1346,26 @@
   }
 
   interactionTasks?.subscribe?.(() => {
+    window.clearTimeout(stateTimer);
+    stateTimer = 0;
+    scheduledState = false;
+    stateScheduleRevision += 1;
     window.clearTimeout(structureRefreshTimer);
     structureRefreshTimer = 0;
+    window.clearTimeout(overlayIdleTimer);
+    overlayIdleTimer = 0;
+    window.clearTimeout(editorDiscoveryTimer);
+    editorDiscoveryTimer = 0;
     if (overlayFrameId) window.cancelAnimationFrame(overlayFrameId);
     overlayFrameId = 0;
     overlayFramePending = false;
-    if (lastEditorState && lastEditorState.value !== cachedStructureSource) {
-      structureRefreshTimer = window.setTimeout(
-        () => refreshStructureCache(lastEditorState, false),
-        180
-      );
-    } else if (structureAnalysisActive && lastEditorState) {
-      // If user activity cancelled the first paint after a completed analysis,
-      // the cache is already current. Repaint it instead of leaving the global
-      // loading indicator waiting for a source change that may never occur.
-      scheduleOverlayRender();
-    }
+    if (pointerStateFrame) window.cancelAnimationFrame(pointerStateFrame);
+    pointerStateFrame = 0;
+    // The editor's own input/selection listeners schedule the single post-idle
+    // state refresh. Do not create replacement timers inside the capture-phase
+    // cancellation path; emitState() also restores any cancelled overlay paint.
   });
+
 
   window.addEventListener(REVIEW_HYDRATION_STATE_EVENT, (event) => {
     let detail = {};
@@ -1368,6 +1403,16 @@
     scheduleOverlayRender();
     scheduleState();
   });
+
+  window.addEventListener(
+    interactionTasks?.keyboardIdleEventName || "smarttex:keyboard-idle",
+    () => {
+      // This is the hard end of the typing freeze. Reconcile state and repaint
+      // once, even if a host observer cancelled or omitted its normal callback.
+      scheduleState();
+      scheduleOverlayRender();
+    }
+  );
 
   window.addEventListener("smarttex:structure-highlight-settings", (event) => {
     const detail = event?.detail || {};
@@ -2394,8 +2439,13 @@
 
   function emitCollaborationPresence() {
     collaborationPresenceTimer = 0;
+    const idleDelay = keyboardIdleDelay();
+    if (idleDelay > 0) {
+      scheduleCollaborationPresence();
+      return false;
+    }
     if (!ensureCollaborationSocket()) return false;
-    const state = getEditorState();
+    const state = lastEditorState;
     const documentId = selectedDocumentId();
     if (!state || !documentId) return false;
     const cursor = editorPositionAtIndex(state.cursorIndex);
@@ -2442,7 +2492,7 @@
     window.clearTimeout(collabtexIdentityDiscoveryTimer);
     collaborationPresenceTimer = window.setTimeout(
       emitCollaborationPresence,
-      immediate ? 0 : 90
+      Math.max(immediate ? 0 : 90, keyboardIdleDelay())
     );
   }
 
@@ -3706,8 +3756,10 @@
     ].join("\n");
   }
 
-  function emitState() {
+  function emitState(expectedRevision = stateScheduleRevision) {
+    if (expectedRevision !== stateScheduleRevision) return;
     scheduledState = false;
+    stateTimer = 0;
     const state = getEditorState();
     if (!state) return;
     lastFingerprint = stateFingerprint(state);
@@ -3720,13 +3772,46 @@
   }
 
   function scheduleState() {
+    if (pointerSelectionActive) return;
     if (scheduledState) return;
     scheduledState = true;
-    // Cursor and selection changes must reach the popup before the next paint.
-    // A microtask still coalesces duplicate editor callbacks from the same
-    // operation without imposing an additional animation-frame delay.
-    queueMicrotask(emitState);
+    const revision = ++stateScheduleRevision;
+    const idleDelay = keyboardIdleDelay();
+    if (idleDelay > 0) {
+      stateTimer = window.setTimeout(() => emitState(revision), idleDelay);
+      return;
+    }
+    // Outside active typing, a microtask coalesces duplicate editor callbacks.
+    queueMicrotask(() => emitState(revision));
   }
+
+  function schedulePointerState() {
+    window.clearTimeout(stateTimer);
+    stateTimer = 0;
+    scheduledState = false;
+    pointerStateRevision = ++stateScheduleRevision;
+    if (pointerStateFrame) return;
+    pointerStateFrame = window.requestAnimationFrame(() => {
+      pointerStateFrame = 0;
+      // Pointer-up has completed and CodeMirror/Ace has committed the clicked
+      // caret. This explicit cursor transaction bypasses only the keyboard idle
+      // delay; all expensive downstream work keeps its own normal scheduling.
+      emitState(pointerStateRevision);
+    });
+  }
+
+  document.addEventListener("pointerdown", () => {
+    pointerSelectionActive = true;
+    interactionTasks?.endKeyboardActivity?.();
+  }, true);
+  document.addEventListener("pointerup", () => {
+    pointerSelectionActive = false;
+    schedulePointerState();
+  }, true);
+  document.addEventListener("pointercancel", () => {
+    pointerSelectionActive = false;
+    schedulePointerState();
+  }, true);
 
   function cleanupCodeMirrorBinding() {
     if (typeof codeMirrorCleanup === "function") codeMirrorCleanup();
@@ -3741,8 +3826,6 @@
     const events = [
       "input",
       "keyup",
-      "mouseup",
-      "click",
       "focus",
       "blur",
       "paste",
@@ -4084,7 +4167,8 @@
     }
   });
 
-  const observer = new MutationObserver(() => {
+  function refreshEditorBinding() {
+    editorDiscoveryTimer = 0;
     const found = findEditor();
     if (found) {
       bindEditor(found);
@@ -4095,17 +4179,28 @@
     }
     if (nativeAutocompleteSuppressed()) hideNativeAutocomplete();
     if (!lastCollabtexIdentityName) scheduleCollabtexIdentityDiscovery(120);
-  });
+  }
+
+  function scheduleEditorBindingRefresh() {
+    const root = editorKind === "codemirror" ? editor?.dom : editor?.container;
+    if (editor && root?.isConnected) return;
+    if (editorDiscoveryTimer) return;
+    editorDiscoveryTimer = window.setTimeout(refreshEditorBinding, keyboardIdleDelay());
+  }
+
+  const observer = new MutationObserver(scheduleEditorBindingRefresh);
   observer.observe(document.documentElement, { childList: true, subtree: true });
 
+  // Editor callbacks are authoritative. Polling previously copied the complete
+  // source every 250 ms and could put fresh keyboard input behind that work.
   const poll = window.setInterval(() => {
-    const found = findEditor();
-    if (found) bindEditor(found);
-    const state = getEditorState();
-    if (state && stateFingerprint(state) !== lastFingerprint) scheduleState();
-  }, 250);
+    if (keyboardIdleDelay() > 0) return;
+    const root = editorKind === "codemirror" ? editor?.dom : editor?.container;
+    if (!editor || !root?.isConnected) refreshEditorBinding();
+  }, 1000);
 
   collaborationSocketPoll = window.setInterval(() => {
+    if (keyboardIdleDelay() > 0) return;
     // Search eagerly during bootstrap, then back off to one scan per 10 s on
     // hosts that do not expose their socket through reachable app state.
     if (collaborationSocketSearchMisses < 6 || collaborationSocketSearchMisses % 5 === 0) {
@@ -4120,7 +4215,9 @@
     lastCollaborationPresenceFingerprint = "";
     scheduleCollaborationPresence();
   }, 4000);
-  ensureCollaborationSocket();
+  window.setTimeout(() => {
+    if (keyboardIdleDelay() === 0) ensureCollaborationSocket();
+  }, 1000);
   scheduleCollabtexIdentityDiscovery(0);
   window.setTimeout(() => scheduleCollabtexIdentityDiscovery(0), 500);
   window.setTimeout(() => scheduleCollabtexIdentityDiscovery(0), 1500);
@@ -4133,6 +4230,10 @@
     window.clearInterval(collaborationPresenceHeartbeat);
     window.clearTimeout(collaborationPresenceTimer);
     window.clearTimeout(collabtexIdentityDiscoveryTimer);
+    window.clearTimeout(stateTimer);
+    window.clearTimeout(structureRefreshTimer);
+    window.clearTimeout(overlayIdleTimer);
+    window.clearTimeout(editorDiscoveryTimer);
     collaborationSocketCleanup?.();
     collaborationSocketCleanup = null;
     collaborationSocket = null;

@@ -6,8 +6,12 @@
   if (global.SmartTeXInteractionTasks) return;
 
   const ACTIVITY_EVENT = "smarttex:user-activity";
+  const KEYBOARD_IDLE_EVENT = "smarttex:keyboard-idle";
   const SCROLL_STATE_EVENT = "smarttex:editor-scroll-state";
   const SCROLLING_CLASS = "smarttex-editor-scrolling";
+  const KEYBOARD_IDLE_MS = 500;
+  const KEYBOARD_TRANSACTION_MS = 120;
+  const FOCUSED_SYNC_SOURCE_LIMIT = 20000;
   const SMARTTEX_SCROLLABLE_SELECTOR = [
     "#smarttex-reference-autocomplete-popup",
     "#smarttex-citation-popup",
@@ -39,6 +43,11 @@
   let nextScheduledId = 1;
   let scrollSettleTimer = 0;
   let scrollActive = false;
+  let lastKeyboardActivityAt = -Infinity;
+  let lastKeyboardSubscriberAt = -Infinity;
+  let keyboardSettleTimer = 0;
+  let cachedEditorStateText = "";
+  let cachedEditorState = null;
   const rememberedScrollPositions = new WeakMap();
   let rememberedWindowScroll = null;
 
@@ -178,6 +187,78 @@
     }
   }
 
+  function keyboardIdleRemaining() {
+    return Math.max(0, KEYBOARD_IDLE_MS - (Date.now() - lastKeyboardActivityAt));
+  }
+
+  function setKeyboardTyping(active) {
+    try {
+      const root = global.document?.documentElement;
+      if (!root) return;
+      if (active) {
+        if (root.getAttribute("data-smarttex-editor-typing") !== "true") {
+          root.setAttribute("data-smarttex-editor-typing", "true");
+        }
+      } else if (root.hasAttribute("data-smarttex-editor-typing")) {
+        root.removeAttribute("data-smarttex-editor-typing");
+      }
+    } catch (_error) {}
+  }
+
+  function finishKeyboardActivity() {
+    keyboardSettleTimer = 0;
+    const remaining = keyboardIdleRemaining();
+    if (remaining > 0) {
+      keyboardSettleTimer = global.setTimeout?.(finishKeyboardActivity, remaining) || 0;
+      return;
+    }
+    setKeyboardTyping(false);
+    try {
+      global.dispatchEvent?.(new CustomEvent(KEYBOARD_IDLE_EVENT, {
+        detail: Object.freeze({ generation, reason: "keyboard-idle" })
+      }));
+    } catch (_error) {}
+  }
+
+  function noteKeyboardActivity(now = Date.now()) {
+    lastKeyboardActivityAt = now;
+    setKeyboardTyping(true);
+    if (keyboardSettleTimer) global.clearTimeout?.(keyboardSettleTimer);
+    keyboardSettleTimer = global.setTimeout?.(finishKeyboardActivity, KEYBOARD_IDLE_MS) || 0;
+  }
+
+  function endKeyboardActivity() {
+    if (keyboardSettleTimer) global.clearTimeout?.(keyboardSettleTimer);
+    keyboardSettleTimer = 0;
+    lastKeyboardActivityAt = -Infinity;
+    setKeyboardTyping(false);
+  }
+
+  function parseEditorState(value) {
+    const text = String(value || "null");
+    if (text !== cachedEditorStateText) {
+      cachedEditorStateText = text;
+      cachedEditorState = JSON.parse(text);
+    }
+    if (!cachedEditorState || typeof cachedEditorState !== "object") return cachedEditorState;
+    return {
+      ...cachedEditorState,
+      cursor: cachedEditorState.cursor ? { ...cachedEditorState.cursor } : cachedEditorState.cursor,
+      screen: cachedEditorState.screen ? { ...cachedEditorState.screen } : cachedEditorState.screen
+    };
+  }
+
+  function canRunLongTask(state, sourceLength = 0) {
+    if (keyboardIdleRemaining() > 0 || pendingUserInput()) return false;
+    return true;
+  }
+
+  function canRunBackgroundTask(state, sourceLength = 0) {
+    if (!canRunLongTask(state, sourceLength)) return false;
+    if (state?.focused === false) return true;
+    return Math.max(0, Number(sourceLength) || 0) <= FOCUSED_SYNC_SOURCE_LIMIT;
+  }
+
   function closestEditorSurface(target) {
     if (!target) return null;
     if (typeof target.closest === "function") return target.closest(EDITOR_SELECTOR);
@@ -227,11 +308,12 @@
     }
   }
 
-  function notify(reason, originalEvent = null) {
+  function notify(reason, originalEvent = null, { notifySubscribers = true } = {}) {
     generation += 1;
     lastReason = String(reason || "user-activity");
     for (const task of activeTasks) task.aborted = true;
     cancelScheduledWork();
+    if (!notifySubscribers) return;
     const detail = Object.freeze({
       generation,
       reason: lastReason,
@@ -253,6 +335,7 @@
 
   function eventReason(event) {
     if (["keydown", "beforeinput", "input"].includes(event?.type)) return "keyboard";
+    if (event?.type === "pointerdown") return "pointer";
     if (event?.type === "wheel") return "wheel";
     if (event?.type === "scroll") return "scroll";
     if (event?.type === "touchmove") return "touch-scroll";
@@ -262,13 +345,27 @@
   function onUserActivity(event) {
     if (!eventBelongsToEditor(event)) return;
     const reason = eventReason(event);
+    let notifySubscribers = true;
+    if (reason === "keyboard") {
+      const now = Date.now();
+      noteKeyboardActivity(now);
+      // A normal edit produces keydown, beforeinput, and input in quick
+      // succession. Invalidating shared tasks on all three preserves immediate
+      // cancellation, but the module subscriber fan-out only needs to happen
+      // once. An input without a recent keydown (paste, speech, IME, etc.) still
+      // receives a full cancellation pass.
+      notifySubscribers = event?.type === "keydown" ||
+        now - lastKeyboardSubscriberAt > KEYBOARD_TRANSACTION_MS;
+      if (notifySubscribers) lastKeyboardSubscriberAt = now;
+    }
+    if (reason === "pointer") endKeyboardActivity();
 
     // Keyboard, wheel and touch events only establish a before-movement baseline
     // and cancel background work. They must not hide overlays by themselves.
     // Overlays are hidden only after the editor emits a scroll event whose
     // scrollTop/scrollLeft actually changed. This also covers automatic editor
     // scrolling when typing moves the caret outside the current viewport.
-    if (reason !== "scroll") rememberPotentialEditorScroll(event);
+    if (reason !== "scroll" && reason !== "keyboard") rememberPotentialEditorScroll(event);
     if (reason === "scroll") {
       if (!scrollPositionChanged(event)) {
         notify(reason, event);
@@ -279,10 +376,10 @@
 
     // This handler never prevents default or stops propagation. It only invalidates
     // SmartTeX work, allowing the host editor to process the event immediately.
-    notify(reason, event);
+    notify(reason, event, { notifySubscribers });
   }
 
-  for (const type of ["keydown", "beforeinput", "input", "wheel", "scroll", "touchmove"]) {
+  for (const type of ["keydown", "beforeinput", "input", "pointerdown", "wheel", "scroll", "touchmove"]) {
     global.addEventListener?.(type, onUserActivity, {
       capture: true,
       passive: type === "wheel" || type === "scroll" || type === "touchmove"
@@ -390,7 +487,15 @@
 
   global.SmartTeXInteractionTasks = Object.freeze({
     eventName: ACTIVITY_EVENT,
+    keyboardIdleEventName: KEYBOARD_IDLE_EVENT,
     scrollStateEventName: SCROLL_STATE_EVENT,
+    keyboardIdleMs: KEYBOARD_IDLE_MS,
+    keyboardIdleRemaining,
+    endKeyboardActivity,
+    parseEditorState,
+    canRunLongTask,
+    canRunBackgroundTask,
+    isKeyboardIdle: () => keyboardIdleRemaining() === 0,
     isScrolling: () => scrollActive,
     generation: () => generation,
     reason: () => lastReason,

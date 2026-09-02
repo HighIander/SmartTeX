@@ -9,6 +9,7 @@
   globalThis.__smartTeXProjectFilesLoaded = true;
 
   const extensionApi = globalThis.browser ?? globalThis.chrome;
+  const interactionTasks = globalThis.SmartTeXInteractionTasks;
   const nextcloud = globalThis.SmartTeXNextcloud;
   if (!nextcloud) {
     console.error("SmartTeX: The Nextcloud client could not be loaded.");
@@ -18,6 +19,11 @@
   const PROJECT_STATE_PREFIX = "smarttex:project-nextcloud:v1:";
   const AUTO_UPDATE_INTERVAL_MS = 60 * 1000;
   const SEARCH_DELAY_MS = 500;
+  const EDITOR_STATE_EVENT = "smarttex:editor-state";
+  const EDITOR_REQUEST_EVENT = "smarttex:citation-editor-request";
+  const EDITOR_RESPONSE_EVENT = "smarttex:citation-editor-response";
+  const NAVIGATION_PUSH_EVENT = "smarttex:navigation-history-push";
+  const FIGURE_FILE_RE = /\.(?:png|jpe?g|gif|webp|svg|pdf|eps|bmp|tiff?)$/i;
   let projectState = null;
   let uiObserver = null;
   let uiTimer = null;
@@ -26,6 +32,15 @@
   let toastTimer = null;
   let stateWriteQueue = Promise.resolve();
   let activeConnectionCache = null;
+  let currentEditorState = null;
+  let editorRequestCounter = 0;
+  const pendingEditorRequests = new Map();
+  const nativeImageOpenTargets = new WeakSet();
+
+  interactionTasks?.subscribe?.(() => {
+    window.clearTimeout(uiTimer);
+    uiTimer = null;
+  });
 
   function projectIdentity() {
     const projectMatch = window.location.pathname.match(/\/project\/([^/?#]+)/i);
@@ -870,6 +885,194 @@
     }
   }
 
+  function editorBridgeRequest(type, payload = {}, timeoutMs = 3000) {
+    const requestId = `project-files-${Date.now()}-${++editorRequestCounter}`;
+    return new Promise((resolve, reject) => {
+      const timeout = window.setTimeout(() => {
+        pendingEditorRequests.delete(requestId);
+        reject(new Error(`SmartTeX editor request timed out: ${type}`));
+      }, timeoutMs);
+      pendingEditorRequests.set(requestId, { resolve, reject, timeout });
+      window.dispatchEvent(new CustomEvent(EDITOR_REQUEST_EVENT, {
+        detail: JSON.stringify({ requestId, type, ...payload })
+      }));
+    });
+  }
+
+  function normalizeFigureStem(value) {
+    return String(value || "")
+      .trim()
+      .replace(/\\/g, "/")
+      .replace(/^\.\//, "")
+      .replace(/\.(?:png|jpe?g|gif|webp|svg|pdf|eps|bmp|tiff?)$/i, "")
+      .toLowerCase();
+  }
+
+  function includegraphicsOccurrences(sourceValue) {
+    const source = String(sourceValue || "");
+    const results = [];
+    const expression = /\\includegraphics(?:\s*\[[^\]]*\])?\s*\{([^{}]+)\}/g;
+    let match;
+    while ((match = expression.exec(source))) {
+      const lineStart = source.lastIndexOf("\n", match.index - 1) + 1;
+      const prefix = source.slice(lineStart, match.index);
+      let commented = false;
+      for (let index = 0; index < prefix.length; index += 1) {
+        if (prefix[index] !== "%") continue;
+        let escapes = 0;
+        for (let cursor = index - 1; cursor >= 0 && prefix[cursor] === "\\"; cursor -= 1) {
+          escapes += 1;
+        }
+        if (escapes % 2 === 0) {
+          commented = true;
+          break;
+        }
+      }
+      if (commented) continue;
+      results.push({
+        path: String(match[1] || "").trim(),
+        index: match.index,
+        end: expression.lastIndex
+      });
+    }
+    return results;
+  }
+
+  function figureOccurrenceForTreeItem(item) {
+    const state = currentEditorState;
+    if (!state?.value) return null;
+    const itemPath = treeItemName(item).replace(/\\/g, "/").replace(/^\/+/, "");
+    const itemStem = normalizeFigureStem(itemPath);
+    const itemBaseStem = itemStem.split("/").pop();
+    if (!itemStem || !itemBaseStem) return null;
+    const occurrences = includegraphicsOccurrences(state.value);
+    return occurrences.find((occurrence) => {
+      const occurrenceStem = normalizeFigureStem(occurrence.path);
+      const occurrenceBaseStem = occurrenceStem.split("/").pop();
+      return (
+        occurrenceStem === itemStem ||
+        occurrenceStem.endsWith(`/${itemStem}`) ||
+        itemStem.endsWith(`/${occurrenceStem}`) ||
+        occurrenceBaseStem === itemBaseStem
+      );
+    }) || null;
+  }
+
+  function figureIconAnchor(item) {
+    return item.querySelector(
+      ".item-type-icon, .file-tree-icon, .entity-icon, [data-testid*='file-icon'], " +
+      "[class*='file-icon'], [class*='entity-icon']"
+    ) || item.querySelector("svg, img")?.parentElement || null;
+  }
+
+  function decorateIncludedFigures() {
+    for (const item of treeItems()) {
+      const fileName = treeItemBaseName(item);
+      const isFigure = FIGURE_FILE_RE.test(fileName);
+      const occurrence = isFigure ? figureOccurrenceForTreeItem(item) : null;
+      item.classList.toggle("smarttex-figure-tree-item", isFigure);
+      item.classList.toggle("smarttex-figure-included", Boolean(occurrence));
+      if (occurrence) item.dataset.smarttexFigureIncludeIndex = String(occurrence.index);
+      else delete item.dataset.smarttexFigureIncludeIndex;
+
+      let badge = item.querySelector(".smarttex-figure-included-badge");
+      if (!occurrence) {
+        badge?.remove();
+        continue;
+      }
+      if (!badge) {
+        badge = document.createElement("span");
+        badge.className = "smarttex-figure-included-badge";
+        badge.setAttribute("aria-hidden", "true");
+        badge.textContent = "✓";
+        let icon = figureIconAnchor(item);
+        if (icon instanceof SVGElement) icon = icon.parentElement;
+        if (icon) {
+          icon.classList.add("smarttex-figure-icon-anchor");
+          icon.appendChild(badge);
+        } else {
+          item.appendChild(badge);
+        }
+      }
+    }
+  }
+
+  function treeItemFromImageEvent(event) {
+    const item = event.target?.closest?.('.file-tree-list [role="treeitem"]');
+    if (!item || !FIGURE_FILE_RE.test(treeItemBaseName(item))) return null;
+    return item;
+  }
+
+  function nativeImageOpenControl(item, eventTarget) {
+    return eventTarget?.closest?.("button, a, [role='button']") || item.querySelector(
+      ".item-name-button, button, a, [role='button']"
+    ) || item;
+  }
+
+  async function jumpToIncludedFigure(item) {
+    const occurrence = figureOccurrenceForTreeItem(item);
+    if (!occurrence || !currentEditorState) return false;
+    const cursorIndex = Math.max(0, Number(currentEditorState.cursorIndex) || 0);
+    const anchor = Math.max(
+      0,
+      Number(currentEditorState.selectionAnchor ?? currentEditorState.selectionFrom ?? cursorIndex) || 0
+    );
+    const head = Math.max(
+      0,
+      Number(currentEditorState.selectionHead ?? currentEditorState.selectionTo ?? cursorIndex) || 0
+    );
+    if (cursorIndex !== occurrence.index) {
+      window.dispatchEvent(new CustomEvent(NAVIGATION_PUSH_EVENT, {
+        detail: JSON.stringify({
+          fileName: String(currentEditorState.fileName || ""),
+          cursorIndex,
+          anchor,
+          head
+        })
+      }));
+    }
+    const response = await editorBridgeRequest("setSelection", {
+      anchor: occurrence.index,
+      head: occurrence.index,
+      focus: true
+    });
+    return Boolean(response?.ok);
+  }
+
+  function bindFigureTreeInteractions() {
+    if (document.documentElement.dataset.smarttexFigureTreeBound === "true") return;
+    document.documentElement.dataset.smarttexFigureTreeBound = "true";
+
+    document.addEventListener("click", (event) => {
+      const item = treeItemFromImageEvent(event);
+      if (!item) return;
+      const control = nativeImageOpenControl(item, event.target);
+      if (nativeImageOpenTargets.has(control)) {
+        nativeImageOpenTargets.delete(control);
+        return;
+      }
+      // A single click on a figure file is reserved for source navigation. It
+      // must not trigger CollabTeX's normal image-open action.
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      const occurrence = figureOccurrenceForTreeItem(item);
+      if (!occurrence) return;
+      jumpToIncludedFigure(item).catch((error) => {
+        console.warn("[SmartTeX] Could not jump to included figure:", error);
+      });
+    }, true);
+
+    document.addEventListener("dblclick", (event) => {
+      const item = treeItemFromImageEvent(event);
+      if (!item) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      const control = nativeImageOpenControl(item, event.target);
+      nativeImageOpenTargets.add(control);
+      control.click();
+    }, true);
+  }
+
   function treeItems() {
     return [...document.querySelectorAll('.file-tree-list [role="treeitem"]')];
   }
@@ -1268,11 +1471,14 @@
   }
 
   function scheduleUiRefresh(delayMs = 80) {
-    window.clearTimeout(uiTimer);
+    if (uiTimer) return;
     uiTimer = window.setTimeout(() => {
       uiTimer = null;
       refreshUi();
-    }, delayMs);
+    }, Math.max(
+      Math.max(0, Number(delayMs) || 0),
+      Number(interactionTasks?.keyboardIdleRemaining?.()) || 0
+    ));
   }
 
   function refreshUi() {
@@ -1280,6 +1486,7 @@
     attachCloudButton();
     injectNextcloudIntoUploadDialogs();
     injectLinkedFileButtons();
+    decorateIncludedFigures();
     injectUpdateAllButton();
   }
 
@@ -1295,14 +1502,47 @@
 
   async function initialize() {
     await loadProjectState();
+    bindFigureTreeInteractions();
     refreshUi();
-    uiObserver = new MutationObserver(() => scheduleUiRefresh());
+    uiObserver = new MutationObserver((mutations) => {
+      const editorSelector = ".ace_editor, .cm-editor, #ide-redesign-panel-source-editor";
+      if (mutations.every((mutation) => (
+        mutation.target instanceof Element && mutation.target.closest(editorSelector)
+      ))) return;
+      scheduleUiRefresh();
+    });
     uiObserver.observe(document.documentElement, {
       childList: true,
       subtree: true
     });
     startAutoUpdateTimer();
   }
+
+  window.addEventListener(EDITOR_STATE_EVENT, (event) => {
+    try {
+      currentEditorState = interactionTasks?.parseEditorState
+        ? interactionTasks.parseEditorState(event.detail)
+        : JSON.parse(String(event.detail || "null"));
+    } catch (_error) {
+      currentEditorState = null;
+    }
+    scheduleUiRefresh(20);
+  });
+
+  window.addEventListener(EDITOR_RESPONSE_EVENT, (event) => {
+    let response;
+    try {
+      response = JSON.parse(String(event.detail || "{}"));
+    } catch (_error) {
+      return;
+    }
+    const pending = pendingEditorRequests.get(response.requestId);
+    if (!pending) return;
+    window.clearTimeout(pending.timeout);
+    pendingEditorRequests.delete(response.requestId);
+    if (response.ok) pending.resolve(response);
+    else pending.reject(new Error(response.error || "SmartTeX editor request failed."));
+  });
 
   extensionApi.storage.onChanged?.addListener((changes, areaName) => {
     if (areaName !== "local" || !changes?.[projectStateKey()]) return;

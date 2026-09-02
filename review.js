@@ -8,6 +8,7 @@
   globalThis.__smartTeXReviewLoaded = true;
 
   const extensionApi = globalThis.browser ?? globalThis.chrome;
+  const interactionTasks = globalThis.SmartTeXInteractionTasks;
   const STATE_EVENT = "smarttex:editor-state";
   const REQUEST_EVENT = "smarttex:citation-editor-request";
   const RESPONSE_EVENT = "smarttex:citation-editor-response";
@@ -58,9 +59,8 @@
   let trackedHistoryQueue = Promise.resolve();
   let pendingRetainedRestore = null;
   let queuedStateDuringRetainedRestore = null;
-  let immediateStateCaptureTimer = 0;
-  let trailingStateCaptureTimer = 0;
-  let settledStateCaptureTimer = 0;
+  let trackedStateCaptureTimer = 0;
+  let lastRoutedStateAt = 0;
   let lastQueuedHistoryKeydownAt = 0;
   let lastQueuedHistoryDirection = "";
   let pane = null;
@@ -655,33 +655,18 @@
 
   function scheduleTrackedStateCapture() {
     if (!trackingEnabled()) return;
-
-    // Editor-state callbacks supplied by the host are usually immediate, but
-    // some CodeMirror/CollabTeX edit paths coalesce or omit one callback when
-    // edits happen in rapid succession.  An immediate read plus one short
-    // trailing read makes tracking lossless without polling while the user is
-    // idle. Duplicate snapshots are harmless because handleEditorState() is
-    // value-idempotent.
-    if (!immediateStateCaptureTimer) {
-      immediateStateCaptureTimer = window.setTimeout(() => {
-        immediateStateCaptureTimer = 0;
-        void captureTrackedEditorState();
-      }, 0);
-    }
-    window.clearTimeout(trailingStateCaptureTimer);
-    trailingStateCaptureTimer = window.setTimeout(() => {
-      trailingStateCaptureTimer = 0;
-      void captureTrackedEditorState();
-    }, 90);
-
-    // CollabTeX can occasionally commit an edit after its DOM/input callbacks
-    // have already fired. A second, debounced settle read after the short
-    // capture catches those delayed commits without doing continuous polling.
-    window.clearTimeout(settledStateCaptureTimer);
-    settledStateCaptureTimer = window.setTimeout(() => {
-      settledStateCaptureTimer = 0;
-      void captureTrackedEditorState();
-    }, 450);
+    const requestedAt = Date.now();
+    const idleDelay = Math.max(
+      500,
+      Number(globalThis.SmartTeXInteractionTasks?.keyboardIdleRemaining?.()) || 0
+    );
+    window.clearTimeout(trackedStateCaptureTimer);
+    trackedStateCaptureTimer = window.setTimeout(() => {
+      trackedStateCaptureTimer = 0;
+      // Normal bridge publication is sufficient. Only copy the complete source
+      // when the host omitted every state callback for this edit.
+      if (lastRoutedStateAt < requestedAt) void captureTrackedEditorState();
+    }, idleDelay + 100);
   }
 
   function queueTrackedHistory(direction) {
@@ -695,6 +680,7 @@
   }
 
   function markLocalInput(event) {
+    if (!trackingEnabled()) return;
     const target = event.target;
     const insideEditor = target?.closest?.(
       ".ace_editor, .ace_text-input, .cm-editor, .cm-content, #ide-redesign-panel-editor, .editor-pane"
@@ -724,23 +710,17 @@
     }
 
     lastLocalInputAt = Date.now();
-    let editingEvent = false;
     if (event.type === "beforeinput") {
       lastLocalInputType = String(event.inputType || "");
-      editingEvent = !String(event.inputType || "").startsWith("history");
     } else if (event.type === "keydown") {
       const key = String(event.key || "");
       if (key === "Backspace") {
         lastLocalInputType = "deleteContentBackward";
-        editingEvent = true;
       } else if (key === "Delete") {
         lastLocalInputType = "deleteContentForward";
-        editingEvent = true;
       }
-    } else if (["input", "paste", "cut", "drop"].includes(event.type)) {
-      editingEvent = true;
     }
-    if (editingEvent) scheduleTrackedStateCapture();
+    if (event.type === "input") scheduleTrackedStateCapture();
   }
 
   for (const eventName of ["beforeinput", "input", "keydown", "paste", "cut", "drop", "pointerdown"]) {
@@ -1581,6 +1561,7 @@
 
   function routeEditorState(next) {
     if (!next || typeof next !== "object") return;
+    lastRoutedStateAt = Date.now();
     if (initialEditorHydrationPending && !applyingTrackedHistory) {
       // Keep only the newest bootstrap snapshot. It is deliberately not used as
       // lastValueByFile until project review metadata has been loaded and a final
@@ -1759,7 +1740,9 @@
 
   window.addEventListener(STATE_EVENT, (event) => {
     try {
-      routeEditorState(JSON.parse(String(event.detail || "{}")));
+      routeEditorState(interactionTasks?.parseEditorState
+        ? interactionTasks.parseEditorState(event.detail)
+        : JSON.parse(String(event.detail || "{}")));
     } catch (_error) {
       // Ignore transient editor-state payloads while the host switches files.
     }
@@ -3324,6 +3307,7 @@
   }, 2000);
 
   window.addEventListener("pagehide", () => {
+    window.clearTimeout(trackedStateCaptureTimer);
     window.clearTimeout(localSaveTimer);
     window.clearTimeout(projectSaveTimer);
     window.clearInterval(projectPollTimer);

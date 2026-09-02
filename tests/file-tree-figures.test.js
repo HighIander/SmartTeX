@@ -1,0 +1,11 @@
+const fs = require('fs');
+const assert = require('assert');
+const source = fs.readFileSync('project-files.js', 'utf8');
+const css = fs.readFileSync('content.css', 'utf8');
+assert.match(source, /includegraphicsOccurrences/);
+assert.match(source, /smarttex-figure-included-badge/);
+assert.match(source, /document\.addEventListener\("click"[\s\S]*?jumpToIncludedFigure/);
+assert.match(source, /NAVIGATION_PUSH_EVENT[\s\S]*?editorBridgeRequest\("setSelection"/);
+assert.match(source, /document\.addEventListener\("dblclick"[\s\S]*?control\.click\(\)/);
+assert.match(css, /\.smarttex-figure-included-badge\s*\{[\s\S]*?background:\s*#1a9b45/);
+console.log('File-tree figure navigation checks passed.');

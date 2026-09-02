@@ -20,11 +20,11 @@ assert.match(review, /const gutterX = Number\(response\.gutterX\)/);
 assert.match(review, /const markerLeft = Number\.isFinite\(gutterX\) \? gutterX \+ 1 : fallbackLeft/);
 assert.match(review, /left: markerLeft[\s\S]*right: markerLeft \+ 4[\s\S]*moveTargetBounds\.top[\s\S]*moveTargetBounds\.bottom[\s\S]*smarttex-review-move-target/);
 
-// State capture has an immediate and trailing fallback so rapidly coalesced
-// host-editor changes are still observed by Track Changes.
-assert.match(review, /function scheduleTrackedStateCapture\(\)[\s\S]*setTimeout\([\s\S]*captureTrackedEditorState/);
-assert.match(review, /trailingStateCaptureTimer[\s\S]*90/);
-assert.match(review, /settledStateCaptureTimer[\s\S]*450/);
+// State capture uses the normal debounced bridge event and performs one full
+// document fallback read only when that event was omitted by the host editor.
+assert.match(review, /function scheduleTrackedStateCapture\(\)[\s\S]*Math\.max\(\s*500,[\s\S]*keyboardIdleRemaining/);
+assert.match(review, /if \(lastRoutedStateAt < requestedAt\) void captureTrackedEditorState\(\)/);
+assert.doesNotMatch(review, /immediateStateCaptureTimer|trailingStateCaptureTimer|settledStateCaptureTimer/);
 assert.match(review, /\["beforeinput", "input", "keydown", "paste", "cut", "drop", "pointerdown"\]/);
 
 // Synthetic retained-delete restoration states are queued and reconciled

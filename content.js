@@ -102,8 +102,138 @@
   const COMMENTS_INITIALIZATION_STATE_EVENT = "smarttex:comments-initialization-state";
   const REVIEW_HYDRATION_STATE_EVENT = "smarttex:review-hydration-state";
   const SOURCE_RENDER_DELAY_MS = 24;
+  const CAPTION_TYPING_RENDER_DELAY_MS = 500;
+  const LIVE_CAPTION_UPDATE_DELAY_MS = 48;
+  const LIVE_EQUATION_UPDATE_DELAY_MS = 48;
   const POPUP_SELECTION_HIGHLIGHT = "smarttex-popup-selection";
   const LATEX_FILE = /\.(?:tex|ltx|sty|cls)$/i;
+
+  /*
+   * SMARTTEX POPUP / OUTLINE BEHAVIOR CONTRACT
+   * ------------------------------------------
+   * The rules below collect the user-visible requirements that drove the
+   * popup, File Outline, and graphics-tree implementation. Keep this block in
+   * sync when any of these behaviors is changed; it is intentionally detailed
+   * so later refactors do not reintroduce regressions that were fixed earlier.
+   *
+   * Popup size and movement
+   * - The S-button/options sliders are the only persistent popup-size setting.
+   *   Their values are relative multipliers of the intrinsic/default width and
+   *   height. Mouse edge/corner resizing is deliberately temporary and affects
+   *   only the currently open popup; it must never overwrite the slider values.
+   *   (An earlier shared-persistence implementation was explicitly superseded.)
+   * - Figure/table captions span the complete popup content width independently
+   *   of the media/table width or aspect ratio. Caption typography is controlled
+   *   by the persistent S-menu caption-font slider (50-200%, with 100% = 11 px);
+   *   the default is deliberately compact and auto-fit must never change the
+   *   caption font while typing. Changing this typography setting refits an open
+   *   popup without invalidating or rerendering the expensive content cache.
+   * - Popup headers use a grab/grabbing hand cursor and are drag handles for a
+   *   temporary position change. Header buttons such as Close remain clickable.
+   * - A visible popup keeps its position. It may relocate only when the cursor
+   *   actually approaches/overlaps its safety margin or when initial placement
+   *   is being chosen. Typing and arrow-key movement inside the owning
+   *   environment use this same rule: content/caret updates never re-anchor the
+   *   popup unless the updated caret would otherwise become too close to it.
+   * - Resize hit zones live almost entirely on the outer border so they do not
+   *   cover content or scrollbar tracks.
+   *
+   * Popup opening, fitting, and rendering
+   * - Cold figure/table/equation previews render invisibly first. SmartTeX waits
+   *   for stable media/KaTeX/table DOM, measures intrinsic geometry, applies the
+   *   slider scale, computes final position, and reveals only once. A loading
+   *   spinner is shown at the initiating pointer/caret during this staged work.
+   * - Transient empty equation/table renders are retried internally instead of
+   *   requiring the user to trigger the popup two or three times.
+   * - Normal fit order is strict: grow the popup first, then uniformly auto-fit
+   *   down to no less than 75% of the requested slider-scaled rendering, and
+   *   only then enable scrollbars. Cached and freshly rendered previews must use
+   *   the same final live-DOM fit solver so cache use cannot cause extra scrollbars.
+   * - Normal equation/table width is capped at 40% of the viewport times the
+   *   relevant size-slider multiplier. A genuinely one-line equation may use up
+   *   to 80% times that multiplier and must never be artificially line-wrapped.
+   *   Intrinsically multiline equations stay on the normal 40% policy.
+   * - Figure height is special: the required natural height includes all media,
+   *   inter-item gaps, and the full caption. A figure popup may grow vertically
+   *   to the usable viewport before the 75%-then-scroll fallback is considered;
+   *   the image must not be cropped merely to reserve caption space.
+   * - Editing an already-open equation or figure/table caption updates that same
+   *   popup live. The popup stays open and stationary and grows/refits when the
+   *   new rendered content requires more space. Equation edits retain the last
+   *   valid rendering through transiently incomplete TeX and replace/refit it as
+   *   soon as the next valid render exists. Equation typing is an in-place
+   *   edit session: secondary cursor/focus/layout events are absorbed while the
+   *   caret remains in the equation, so the generic trigger cannot close/reopen
+   *   the popup after the first live update. The rendered equation caret is also
+   *   refreshed in-place on arrow-key movement. When the editor caret is inside
+   *   a figure/table caption, the same caret is rendered inside the popup caption
+   *   and follows both arrow-key movement and typing. Caption text gets a lightweight
+   *   near-live update in the same mounted figure/table popup; it must not fall
+   *   through into a delayed full-popup render. The independent idle cache
+   *   warmer performs the expensive settled-source parse/cache refresh later.
+   * - More generally, an environment popup is owned by that environment until
+   *   the caret actually leaves it (or the user explicitly closes it). Generic
+   *   focus/scroll/layout cleanup and stale queued renders must never tear down
+   *   and recreate an equation/figure/table popup while the caret is still inside.
+   * - Manually closing an environment preview keeps it dismissed while the user
+   *   continues typing inside that environment; source-length changes must not
+   *   make the dismissed popup reopen unexpectedly.
+   *
+   * Caching and responsiveness
+   * - Full figure/table/equation popup markup, rendered captions, and structure
+   *   hover thumbnails are cached with bounded LRU caches and warmed during idle
+   *   time. Cache warming is intentionally nonvisual; the temporary green
+   *   cache diagnostic dots in source lines and popup headers have been removed.
+   *   Warming starts from the first available document state—even before
+   *   popup interaction is enabled—and progressively covers all display-preview
+   *   environments, prioritizing those nearest the caret. A full-document source
+   *   signature already invalidates entries after any edit, so environment cache
+   *   identity is deliberately just kind + opening source position within that
+   *   signature; redundant context-body hashes must not make a background-warmed
+   *   equation miss on its first opening. Unchanged figure/table cache identity is
+   *   independent of caret moves.
+   * - Cached DOM is cloned into a fresh display instance; transient selection,
+   *   scroll, zoom, drag, and handler state is never reused as live popup state.
+   *   Figure cache entries additionally retain references to their already-decoded
+   *   media nodes. Keeping those decoded resources alive makes the first popup
+   *   opening after background warming paint as quickly as the outline thumbnail
+   *   instead of paying a second image/PDF decode cost.
+   * - Cache hits reuse expensive rendered content but still validate/recompute
+   *   fit from current live DOM/font/media metrics. Warm hits therefore display
+   *   quickly without producing dimensions different from the cold render path.
+   *
+   * CollabTeX graphics tree
+   * - Included graphics files receive a green checkmark overlay on the native
+   *   file-type icon. Single-click on an included graphic jumps the source editor
+   *   to its includegraphics location and pushes the standard Back navigation;
+   *   double-click retains CollabTeX's native behavior of opening the image file.
+   * - Hovering graphics files shows a cached thumbnail popup. Native title/tooltips
+   *   are suppressed while the richer preview is active. Its loading spinner
+   *   follows the pointer and is removed only on success/cancel/failure.
+   *
+   * CollabTeX File Outline
+   * - Numbered equations, figures, and tables are merged into the native outline
+   *   underneath their deepest active section/subsection, in document order, with
+   *   compact labels such as "Fig. 2: [label]" / "Eq. (5): [label]". Entries are
+   *   one line only (ellipsis instead of wrapping) and use the normal Back-aware
+   *   editor jump path.
+   * - Small disclosure arrows on section/subsection headers hide/show only their
+   *   SmartTeX numbered entries, not CollabTeX's native subsection hierarchy.
+   * - The current-position marker resolves to the deepest visible target: the
+   *   latest numbered item when those items are expanded, otherwise the native
+   *   section/subsection. Clicking a numbered item updates that marker immediately.
+   * - Numbered rows are deliberately one-line/truncated navigation targets. Clicking
+   *   a long row may scroll the outline vertically to keep the active item visible,
+   *   but it must preserve every outline-pane ancestor's horizontal scroll position;
+   *   navigation must never pan the File Outline to the right merely to expose a
+   *   truncated label. This includes the immediate active-indicator update, the
+   *   next-frame React reconciliation pass, and the asynchronous editor jump.
+   * - Hovering numbered outline entries shows a compact cached preview. Figure
+   *   thumbnails preserve parsed panel/row layout (including vertical stacking),
+   *   equation/table previews are rendered, and figure/table captions render the
+   *   same LaTeX/macros/references as normal popups. The full caption must fit;
+   *   native browser tooltips are suppressed when the thumbnail preview exists.
+   */
   const extensionApi = globalThis.browser ?? globalThis.chrome;
   const contextTools = globalThis.SmartTeXLatexContext;
   const interactionTasks = globalThis.SmartTeXInteractionTasks;
@@ -321,6 +451,7 @@
   previewZoomControls.append(previewZoomOut, previewZoomOutput, previewZoomIn);
   preview.appendChild(previewZoomControls);
   let previewZoom = 1;
+  let previewAutoFitZoom = 1;
   let previewZoomKind = "equation";
 
   function popupContentScale() {
@@ -336,32 +467,10 @@
 
   function fitTablePreview() {
     if (preview.dataset.previewKind !== "table") return;
-    const tablePopup = output.querySelector(":scope > .smarttex-table-popup");
-    const table = tablePopup?.querySelector(".smarttex-table-preview");
-    if (!tablePopup || !table) return;
     const baseScale = popupContentScale();
-    preview.style.setProperty("--smarttex-table-render-scale", String(baseScale));
-    const outputStyle = globalThis.getComputedStyle?.(output);
-    const availableWidth = Math.max(
-      40,
-      output.clientWidth - (parseFloat(outputStyle?.paddingLeft) || 0) -
-        (parseFloat(outputStyle?.paddingRight) || 0)
-    );
-    const availableHeight = Math.max(
-      40,
-      output.clientHeight - (parseFloat(outputStyle?.paddingTop) || 0) -
-        (parseFloat(outputStyle?.paddingBottom) || 0)
-    );
-    const popupRect = tablePopup.getBoundingClientRect();
-    const tableRect = table.getBoundingClientRect();
-    const fitScale = Math.min(
-      1,
-      availableWidth / Math.max(1, tableRect.width),
-      availableHeight / Math.max(1, popupRect.height)
-    );
     preview.style.setProperty(
       "--smarttex-table-render-scale",
-      String(Math.max(0.12, baseScale * fitScale * previewZoom))
+      String(Math.max(0.12, baseScale * previewZoom * previewAutoFitZoom))
     );
   }
 
@@ -375,9 +484,13 @@
     );
     previewZoomOutput.value = `${Math.round(previewZoom * 100)}%`;
     previewZoomOutput.textContent = previewZoomOutput.value;
+    const baseScale = popupContentScale();
+    const effectiveScale = Math.max(0.05, baseScale * previewAutoFitZoom);
+    preview.style.setProperty("--smarttex-popup-auto-fit-scale", String(previewAutoFitZoom));
+    preview.style.setProperty("--smarttex-popup-effective-scale", String(effectiveScale));
     preview.style.setProperty(
       "--smarttex-equation-render-scale",
-      String(popupContentScale() * previewZoom)
+      String(baseScale * previewZoom * previewAutoFitZoom)
     );
     fitTablePreview();
   }
@@ -385,6 +498,17 @@
   function setPreviewZoom(value) {
     previewZoom = Math.max(0.25, Math.min(5, Number(value) || 1));
     refreshPreviewZoom();
+    window.requestAnimationFrame(() => {
+      if (preview.hidden || preview.dataset.smarttexStaging === "true") return;
+      globalThis.SmartTeXFigureRenderer?.fitPopupLayout?.(
+        output.querySelector(".smarttex-figure-layout")
+      );
+      const metrics = previewOverflowMetrics();
+      preview.classList.toggle(
+        "smarttex-preview-scroll-fallback",
+        Boolean(metrics.overflowX || metrics.overflowY)
+      );
+    });
   }
 
   for (const button of [previewZoomOut, previewZoomIn]) {
@@ -411,7 +535,12 @@
       output.querySelector(".smarttex-figure-layout")
     );
     refreshPreviewZoom();
-    if (!event.detail?.live) positionPreviewAtCursor();
+    // Slider sizing is also applied while a newly opened popup is staged. Do
+    // not run the normal visible-popup reposition callback until staging has
+    // completed; the reveal pipeline performs one final position instead.
+    if (!event.detail?.live && preview.dataset.smarttexStaging !== "true") {
+      positionPreviewAtCursor();
+    }
   });
   const optionsButton = document.createElement("button");
   optionsButton.id = "smarttex-options-button";
@@ -578,13 +707,22 @@
   let environmentHoverGeneration = 0;
   let renderTimer = null;
   let renderGeneration = 0;
+  let scheduledPreviewHint = null;
   let activeContextId = "";
   const dismissedPreviewContexts = new Map();
   let caretPlacementState = null;
   let lastSuccessfulMarkup = "";
   let captionPreviewLock = null;
+  let liveCaptionUpdateTimer = null;
+  let liveEquationUpdateTimer = null;
+  // While an equation is being edited, keep one explicit edit session alive
+  // until the caret leaves that equation. Generic editor state/focus/layout
+  // notifications must not tear down and recreate the popup between keystrokes.
+  let liveEquationEditSession = null;
+  let activeFloatCaptionRenderInfo = null;
   let previewPositioned = false;
   let activePreviewContext = null;
+  let lastFloatPreviewContextHint = null;
   let documentAnalysisCache = {
     fileName: "",
     source: null,
@@ -620,12 +758,20 @@
   let customGraphicAutocompletePreviewSuppressed = false;
   let graphicAutocompleteClickPreview = false;
   let lastEditorTextInputAt = 0;
+  // Text input and CollabTeX editor-state publication are not atomic. Some
+  // editor builds briefly report the newly edited source with an old/zero
+  // cursor index (and sometimes focus=false/screen=null) before publishing the
+  // corrected caret state. Remember which mounted environment owned the actual
+  // DOM input event so those transient states cannot close/reopen its popup.
+  let activeEnvironmentInputTransaction = null;
   let activeEditorReferenceKey = "";
   let activeEditorReferenceType = "";
   let activeSecondaryEditorReferenceKey = "";
   let captionInnerReferenceActive = false;
   let popupLoadingSpinner = null;
   let popupLoadingSpinnerGeneration = 0;
+  let environmentPopupLoadingSpinner = null;
+  let environmentPopupLoadingSpinnerGeneration = 0;
   let previewLoadingGeneration = 0;
   let previewLoadingGlobalGeneration = null;
   let referencePopupInteractionUntil = 0;
@@ -656,6 +802,11 @@
     }
     graphicAutocompleteGeneration += 1;
     previewPositionGeneration += 1;
+    if (previewCacheWarmTimer !== null) window.clearTimeout(previewCacheWarmTimer);
+    previewCacheWarmTimer = null;
+    previewCacheWarmGeneration += 1;
+    if (numberedOutlineUpdateTimer !== null) window.clearTimeout(numberedOutlineUpdateTimer);
+    numberedOutlineUpdateTimer = null;
   });
 
   preview.addEventListener("pointerenter", () => {
@@ -708,6 +859,1343 @@
     }));
   }
 
+  let numberedOutlineUpdateTimer = null;
+  let numberedOutlinePaneObserver = null;
+  let numberedOutlineObservedPane = null;
+  let numberedOutlineDiscoveryObserver = null;
+  let numberedOutlineCacheFileName = "";
+  let numberedOutlineCacheSource = null;
+  let numberedOutlineCacheEntries = [];
+  const numberedOutlineCollapsedSections = new Set();
+  let numberedOutlinePendingCursorIndex = null;
+  let numberedOutlinePendingCursorTimer = null;
+  let numberedOutlineActiveSourceIndex = null;
+
+  const STRUCTURE_HOVER_PREVIEW_DELAY_MS = 180;
+  let structureHoverPreviewTimer = null;
+  let structureHoverPreviewGeneration = 0;
+  let structureHoverPreviewAnchor = null;
+  let structureHoverSpinner = null;
+  let structureHoverSpinnerVisible = false;
+  let structureHoverPointer = null;
+  let structureHoverTooltipRoot = null;
+  const structureHoverSuppressedTitles = new Map();
+
+  const PREVIEW_RENDER_CACHE_LIMIT = 256;
+  const STRUCTURE_HOVER_CACHE_LIMIT = 96;
+  const CAPTION_RENDER_CACHE_LIMIT = 160;
+  const previewRenderCache = new Map();
+  const previewBaseRenderCache = new Map();
+  const structureHoverRenderCache = new Map();
+  const captionRenderCache = new Map();
+  let previewCacheWarmTimer = null;
+  let previewCacheWarmGeneration = 0;
+  let previewSourceSignatureCacheSource = null;
+  let previewSourceSignatureCacheFileName = "";
+  let previewSourceSignatureCacheValue = "";
+
+  function previewElementKind(context) {
+    // Equation parser contexts describe their TeX syntax as "environment" or
+    // "delimiter" because latex-context.js needs that distinction to build the
+    // rendered body. Popup/cache code, however, has only three logical preview
+    // types: figure, table and equation. Always normalize through this helper
+    // before constructing cache keys or making popup-lifecycle decisions.
+    //
+    // This distinction is critical for proactive equation caching: the idle
+    // warmer explicitly labels its entry as "equation", whereas the context
+    // found later under the editor cursor still has kind "environment". Using
+    // context.kind directly therefore produced two keys for the same unchanged
+    // equation and made its first visible opening miss a genuinely warm cache.
+    const kind = String(context?.kind || context?.type || "");
+    if (kind === "figure") return "figure";
+    if (kind === "table") return "table";
+    return "equation";
+  }
+
+
+  function setPopupOpenedFromCache(cached) {
+    // Keep a nonvisual cache-origin flag for internal debugging/tests, but do
+    // not expose cache diagnostics as green dots in source or popup chrome.
+    preview.dataset.smarttexOpenedFromCache = Boolean(cached) ? "true" : "false";
+  }
+
+  function fastPreviewHash(value) {
+    const text = String(value || "");
+    let hash = 2166136261;
+    for (let index = 0; index < text.length; index += 1) {
+      hash ^= text.charCodeAt(index);
+      hash = Math.imul(hash, 16777619);
+    }
+    return (hash >>> 0).toString(36);
+  }
+
+  function lruCacheGet(cache, key) {
+    if (!cache.has(key)) return null;
+    const value = cache.get(key);
+    cache.delete(key);
+    cache.set(key, value);
+    return value;
+  }
+
+  function lruCacheSet(cache, key, value, limit) {
+    cache.delete(key);
+    cache.set(key, value);
+    while (cache.size > limit) cache.delete(cache.keys().next().value);
+    return value;
+  }
+
+  function htmlNodeClone(markup) {
+    const template = document.createElement("template");
+    template.innerHTML = String(markup || "").trim();
+    return template.content.firstElementChild || null;
+  }
+
+  function normalizedPreviewCacheEntry(value) {
+    if (!value) return null;
+    if (typeof value === "string") return { markup: value, metrics: null };
+    if (typeof value === "object" && typeof value.markup === "string") return value;
+    return null;
+  }
+
+  function previewCacheSet(cache, key, markup, metrics = null, extras = null) {
+    const previous = normalizedPreviewCacheEntry(cache.get(key));
+    // Background figure warming fully decodes raster/PDF preview images. Keep
+    // those detached media nodes referenced by the LRU entry so the browser's
+    // decoded-image cache stays hot until eviction. The visible popup still gets
+    // fresh DOM markup, so no live scroll/drag/event state is shared.
+    const mediaKeepalive = extras?.mediaKeepalive ?? previous?.mediaKeepalive ?? null;
+    return lruCacheSet(
+      cache,
+      key,
+      {
+        markup: String(markup || ""),
+        metrics: metrics || null,
+        ...(mediaKeepalive ? { mediaKeepalive } : {})
+      },
+      PREVIEW_RENDER_CACHE_LIMIT
+    );
+  }
+
+  function canonicalPreviewBaseMarkup(markup) {
+    const template = document.createElement("template");
+    template.innerHTML = String(markup || "");
+    for (const caret of template.content.querySelectorAll(
+      ".smarttex-rendered-caret, .smarttex-rendered-operator-caret"
+    )) {
+      caret.remove();
+    }
+    // Selection highlighting is applied to the live popup after the cached
+    // rendering has been installed. Never let such transient UI state become
+    // part of the cursor-independent base cache.
+    for (const selected of template.content.querySelectorAll(".smarttex-popup-selection")) {
+      selected.classList.remove("smarttex-popup-selection");
+    }
+    return template.innerHTML;
+  }
+
+  function stabilizeCachedPreviewMedia(root) {
+    if (!(root instanceof Element)) return;
+    for (const image of root.querySelectorAll("img")) {
+      const width = Number(image.naturalWidth) || Number(image.getAttribute("width")) || 0;
+      const height = Number(image.naturalHeight) || Number(image.getAttribute("height")) || 0;
+      if (!(width > 0 && height > 0)) continue;
+      // Width/height attributes preserve the decoded aspect ratio even for a
+      // freshly cloned cached <img> whose resource has not completed its first
+      // layout turn yet. CSS still controls the actual display width.
+      image.setAttribute("width", String(Math.round(width)));
+      image.setAttribute("height", String(Math.round(height)));
+      image.style.aspectRatio = `${width} / ${height}`;
+    }
+  }
+
+  function cachedPreviewMediaGeometryReady(root) {
+    return [...root.querySelectorAll("img")].every((image) => {
+      if (image.complete && Number(image.naturalWidth) > 0) return true;
+      return (
+        Number(image.getAttribute("width")) > 0 &&
+        Number(image.getAttribute("height")) > 0
+      );
+    });
+  }
+
+  function measuredPreviewCacheEntry(cache, key) {
+    const entry = normalizedPreviewCacheEntry(cache.get(key));
+    return entry?.markup && entry?.metrics?.naturalSize ? entry : null;
+  }
+
+  function previewSourceSignature(state = currentState) {
+    const fileName = String(state?.fileName || "");
+    const source = String(state?.value || "");
+    if (
+      source === previewSourceSignatureCacheSource &&
+      fileName === previewSourceSignatureCacheFileName
+    ) {
+      return previewSourceSignatureCacheValue;
+    }
+    previewSourceSignatureCacheSource = source;
+    previewSourceSignatureCacheFileName = fileName;
+    previewSourceSignatureCacheValue = `${fileName}::${fastPreviewHash(source)}`;
+    return previewSourceSignatureCacheValue;
+  }
+
+  function previewBaseCacheKey(state, context) {
+    // previewSourceSignature() hashes the complete LaTeX source. Therefore a
+    // second hash of context.source is redundant and, more importantly, can
+    // differ between the proactive equation analyzer and the cursor-local
+    // context finder even though they refer to the same unchanged environment.
+    // Use the stable environment identity inside the document signature so a
+    // background-warmed equation is guaranteed to hit on its very first open.
+    return [
+      previewSourceSignature(state),
+      previewElementKind(context),
+      Number(context?.openStart ?? context?.sourceIndex ?? 0)
+    ].join("::");
+  }
+
+  function previewExactCacheKey(state, context) {
+    const kind = previewElementKind(context);
+    let cursorIndex = Number(state?.cursorIndex ?? -1);
+    let selectionFrom = Number(state?.selectionFrom ?? state?.cursorIndex ?? -1);
+    let selectionTo = Number(state?.selectionTo ?? state?.cursorIndex ?? -1);
+
+    // Figure/table rendering is structurally cursor-independent for a collapsed
+    // selection. The visual caret is transient UI and is stripped before the
+    // base/exact cache is stored. Keeping a single key for the whole float
+    // prevents cache misses merely because the caret moved inside its caption
+    // or table body.
+    if ((kind === "figure" || kind === "table") && selectionFrom === selectionTo) {
+      cursorIndex = -1;
+      selectionFrom = -1;
+      selectionTo = -1;
+    }
+
+    return [
+      previewBaseCacheKey(state, context),
+      cursorIndex,
+      selectionFrom,
+      selectionTo
+    ].join("::");
+  }
+
+  function structureHoverCacheKey(entry) {
+    return [
+      previewSourceSignature(currentState),
+      String(entry?.type || ""),
+      Number(entry?.sourceIndex || 0),
+      String(entry?.number || ""),
+      String(entry?.label || ""),
+      fastPreviewHash(entry?.caption || "")
+    ].join("::");
+  }
+
+  function ensureStructureHoverPreview() {
+    let popup = document.getElementById("smarttex-structure-hover-preview");
+    if (popup) return popup;
+    popup = document.createElement("div");
+    popup.id = "smarttex-structure-hover-preview";
+    popup.className = "smarttex-structure-hover-preview";
+    popup.hidden = true;
+    popup.setAttribute("aria-hidden", "true");
+    document.body.appendChild(popup);
+    return popup;
+  }
+
+  function ensureStructureHoverSpinner() {
+    if (structureHoverSpinner?.isConnected) return structureHoverSpinner;
+    structureHoverSpinner = document.createElement("span");
+    structureHoverSpinner.className =
+      "smarttex-popup-loading-spinner smarttex-structure-hover-loading-spinner";
+    structureHoverSpinner.hidden = true;
+    structureHoverSpinner.setAttribute("role", "status");
+    structureHoverSpinner.setAttribute("aria-label", "Loading preview");
+    document.body.appendChild(structureHoverSpinner);
+    return structureHoverSpinner;
+  }
+
+  function updateStructureHoverPointer(event) {
+    if (!event || !Number.isFinite(Number(event.clientX)) || !Number.isFinite(Number(event.clientY))) return;
+    structureHoverPointer = { x: Number(event.clientX), y: Number(event.clientY) };
+    if (!structureHoverSpinnerVisible) return;
+    const spinner = ensureStructureHoverSpinner();
+    spinner.style.left = `${Math.round(structureHoverPointer.x + 12)}px`;
+    spinner.style.top = `${Math.round(structureHoverPointer.y + 12)}px`;
+  }
+
+  function showStructureHoverSpinner() {
+    const spinner = ensureStructureHoverSpinner();
+    const point = structureHoverPointer;
+    if (!point) return;
+    structureHoverSpinnerVisible = true;
+    spinner.style.left = `${Math.round(point.x + 12)}px`;
+    spinner.style.top = `${Math.round(point.y + 12)}px`;
+    spinner.hidden = false;
+  }
+
+  function hideStructureHoverSpinner() {
+    structureHoverSpinnerVisible = false;
+    if (structureHoverSpinner) structureHoverSpinner.hidden = true;
+  }
+
+  function restoreStructureHoverTooltips() {
+    for (const [node, title] of structureHoverSuppressedTitles) {
+      if (!(node instanceof Element) || !node.isConnected) continue;
+      if (title === null) node.removeAttribute("title");
+      else node.setAttribute("title", title);
+    }
+    structureHoverSuppressedTitles.clear();
+    structureHoverTooltipRoot = null;
+  }
+
+  function suppressStructureHoverTooltips(root) {
+    if (!(root instanceof Element)) return;
+    if (structureHoverTooltipRoot === root) return;
+    restoreStructureHoverTooltips();
+    structureHoverTooltipRoot = root;
+    const nodes = [root, ...root.querySelectorAll("[title]")];
+    for (const node of nodes) {
+      if (!(node instanceof Element) || !node.hasAttribute("title")) continue;
+      structureHoverSuppressedTitles.set(node, node.getAttribute("title"));
+      node.removeAttribute("title");
+    }
+  }
+
+  function hideStructureHoverPreview({ invalidate = true } = {}) {
+    if (structureHoverPreviewTimer !== null) {
+      window.clearTimeout(structureHoverPreviewTimer);
+      structureHoverPreviewTimer = null;
+    }
+    if (invalidate) structureHoverPreviewGeneration += 1;
+    structureHoverPreviewAnchor = null;
+    hideStructureHoverSpinner();
+    const popup = document.getElementById("smarttex-structure-hover-preview");
+    if (!popup) return;
+    popup.hidden = true;
+    popup.setAttribute("aria-hidden", "true");
+    popup.classList.remove("smarttex-structure-hover-preview-measuring");
+    popup.replaceChildren();
+  }
+
+  function positionStructureHoverPreview(anchor, popup) {
+    if (!(anchor instanceof Element) || !(popup instanceof Element)) return;
+    const anchorRect = anchor.getBoundingClientRect();
+    const popupRect = popup.getBoundingClientRect();
+    const margin = 10;
+    const gap = 9;
+    const width = Math.min(popupRect.width || 280, Math.max(120, window.innerWidth - margin * 2));
+    const height = Math.min(popupRect.height || 180, Math.max(80, window.innerHeight - margin * 2));
+    let left = anchorRect.right + gap;
+    if (left + width > window.innerWidth - margin) {
+      left = anchorRect.left - gap - width;
+    }
+    left = Math.max(margin, Math.min(left, window.innerWidth - margin - width));
+    let top = anchorRect.top + Math.min(4, Math.max(0, anchorRect.height * 0.2));
+    top = Math.max(margin, Math.min(top, window.innerHeight - margin - height));
+    popup.style.left = `${Math.round(left)}px`;
+    popup.style.top = `${Math.round(top)}px`;
+  }
+
+  async function resolveStructureHoverMedia(pathValue) {
+    const path = String(pathValue || "").trim();
+    if (!path) throw new Error("Figure path is empty.");
+    const renderer = await ensureFigureRendererReady();
+    let file = directFigureFile(path);
+    if (!file?.url) {
+      const response = await bridgeRequest("resolveProjectFile", { path });
+      file = response?.file || null;
+    }
+    if (!file?.url) throw new Error("Figure URL is unavailable.");
+    const media = await renderer.createMedia(file.path || path, file.url, {
+      imageClass: "smarttex-structure-hover-image",
+      pdfClass: "smarttex-structure-hover-image smarttex-structure-hover-pdf"
+    });
+    if (typeof media.decode === "function") {
+      try { await media.decode(); } catch (_error) {
+        if (!media.complete || !media.naturalWidth) throw _error;
+      }
+    }
+    return media;
+  }
+
+  function numberedOutlinePreviewContext(entry) {
+    const source = String(currentState?.value || "");
+    const sourceIndex = Math.max(0, Number(entry?.sourceIndex) || 0);
+    if (!source) return null;
+
+    // Background warming can pass a context that was already obtained from the
+    // document-analysis cache. Reuse it directly instead of locating the same
+    // environment again from a synthetic cursor position. Besides reducing the
+    // warm-up cost, this also lets unnumbered display equations/float contexts
+    // participate in the full-popup cache even though they have no outline row.
+    if (entry?.context) {
+      const type = String(entry.type || entry.context.kind || "equation");
+      return {
+        type,
+        number: String(entry.number || ""),
+        sourceIndex,
+        context: entry.context,
+        caption: String(entry.caption || ""),
+        numbering: type === "equation"
+          ? (entry.numbering || contextTools.equationPreviewNumbering?.(source, entry.context) || null)
+          : null
+      };
+    }
+    if (entry?.label) {
+      const labelled = contextTools.referenceTarget?.(source, entry.label);
+      if (labelled) return labelled;
+    }
+    if (entry?.type === "equation") {
+      const context = contextTools.findEquationContext?.(source, sourceIndex + 1);
+      if (!context) return null;
+      return {
+        type: "equation",
+        number: String(entry.number || ""),
+        sourceIndex,
+        context,
+        numbering: contextTools.equationPreviewNumbering?.(source, context) || null
+      };
+    }
+    if (entry?.type === "figure") {
+      const context = contextTools.findFigureContext?.(source, sourceIndex + 1);
+      return context ? { type: "figure", sourceIndex, context, caption: entry.caption || "" } : null;
+    }
+    if (entry?.type === "table") {
+      const context = contextTools.findTableFloatContext?.(source, sourceIndex + 1) ||
+        contextTools.findTableContext?.(source, sourceIndex + 1);
+      return context ? { type: "table", sourceIndex, context, caption: entry.caption || "" } : null;
+    }
+    return null;
+  }
+
+  function appendStructureHoverCaption(
+    container,
+    source,
+    sourceIndex,
+    captionText,
+    captionSourceOffset = null
+  ) {
+    const text = String(captionText || "").trim();
+    if (!text) return null;
+    const prepared = contextTools.prepareDocumentCommands(
+      source,
+      Math.max(0, Number(sourceIndex) || 0),
+      text
+    );
+    const captionNode = document.createElement("div");
+    captionNode.className = "smarttex-structure-hover-caption";
+    captionNode.appendChild(tableRenderer.renderInlineLatex(prepared.body, {
+      contextTools,
+      document,
+      katex,
+      macros: prepared.macros,
+      trust: trustedKatexCommand,
+      sourceOffset: Number.isFinite(Number(captionSourceOffset))
+        ? Number(captionSourceOffset)
+        : undefined,
+      renderReference: createCaptionReferenceLink
+    }));
+    container.appendChild(captionNode);
+    return captionNode;
+  }
+
+  async function buildNumberedOutlineHoverPreview(entry) {
+    const source = String(currentState?.value || "");
+    const target = numberedOutlinePreviewContext(entry);
+    if (!target) throw new Error("Preview source is unavailable.");
+    const wrapper = document.createElement("div");
+    wrapper.className = `smarttex-structure-hover-content smarttex-structure-hover-${entry.type}`;
+
+    const title = document.createElement("div");
+    title.className = "smarttex-structure-hover-title";
+    title.textContent = numberedOutlineEntryText(entry);
+    wrapper.appendChild(title);
+
+    const body = document.createElement("div");
+    body.className = "smarttex-structure-hover-body";
+    wrapper.appendChild(body);
+
+    if (entry.type === "figure") {
+      const renderer = await ensureFigureRendererReady();
+      const layout = renderer.parseFigureLayout?.(target.context.source || "", {
+        environment: target.context.environment
+      });
+      const figureLayout = document.createElement("div");
+      figureLayout.className = "smarttex-structure-hover-figure-layout";
+      const mediaTasks = [];
+      let imageCount = 0;
+
+      for (const rowModel of layout?.rows || []) {
+        const row = document.createElement("div");
+        row.className = "smarttex-structure-hover-figure-row";
+        const items = rowModel.items || [];
+        const relativeTotal = Math.max(
+          0,
+          Number(rowModel.relativeWidthRatio) || items.reduce(
+            (sum, item) => sum + Math.max(0, Number(item.widthRatio) || 1),
+            0
+          )
+        ) || 1;
+        for (const itemModel of items) {
+          const panel = document.createElement("div");
+          panel.className = "smarttex-structure-hover-figure-panel";
+          const widthRatio = Math.max(0.05, Number(itemModel.widthRatio) || 1);
+          const fraction = rowModel.normalizeRelativeWidths === false
+            ? Math.min(1, widthRatio)
+            : Math.min(1, widthRatio / relativeTotal);
+          panel.style.flex = `${fraction} 1 0`;
+
+          for (const imageModel of itemModel.images || []) {
+            const path = String(imageModel.path || "").trim();
+            if (!path) continue;
+            imageCount += 1;
+            const slot = document.createElement("div");
+            slot.className = "smarttex-structure-hover-figure-image-slot";
+            panel.appendChild(slot);
+            mediaTasks.push((async () => {
+              try {
+                const media = await resolveStructureHoverMedia(path);
+                slot.replaceChildren(media);
+              } catch (_error) {
+                const missing = document.createElement("div");
+                missing.className = "smarttex-structure-hover-missing";
+                missing.textContent = "Preview unavailable";
+                slot.replaceChildren(missing);
+              }
+            })());
+          }
+          if (panel.childElementCount) row.appendChild(panel);
+        }
+        if (row.childElementCount) figureLayout.appendChild(row);
+      }
+
+      // Older or unusual figure syntax may not be represented by the layout
+      // parser. Preserve source order and stack those graphics vertically.
+      if (!imageCount) {
+        const matches = [...String(target.context.source || "").matchAll(
+          /\\includegraphics(?:\s*\[[^\]]*\])?\s*\{([^{}]+)\}/gi
+        )];
+        for (const match of matches) {
+          const path = String(match[1] || "").trim();
+          if (!path) continue;
+          imageCount += 1;
+          const row = document.createElement("div");
+          row.className = "smarttex-structure-hover-figure-row";
+          const panel = document.createElement("div");
+          panel.className = "smarttex-structure-hover-figure-panel";
+          const slot = document.createElement("div");
+          slot.className = "smarttex-structure-hover-figure-image-slot";
+          panel.appendChild(slot);
+          row.appendChild(panel);
+          figureLayout.appendChild(row);
+          mediaTasks.push((async () => {
+            try { slot.replaceChildren(await resolveStructureHoverMedia(path)); }
+            catch (_error) {
+              const missing = document.createElement("div");
+              missing.className = "smarttex-structure-hover-missing";
+              missing.textContent = "Preview unavailable";
+              slot.replaceChildren(missing);
+            }
+          })());
+        }
+      }
+
+      await Promise.all(mediaTasks);
+      if (!imageCount) {
+        const missing = document.createElement("div");
+        missing.className = "smarttex-structure-hover-missing";
+        missing.textContent = "Preview unavailable";
+        figureLayout.appendChild(missing);
+      }
+      body.appendChild(figureLayout);
+      appendStructureHoverCaption(
+        body,
+        source,
+        target.sourceIndex,
+        entry.caption || target.caption || "",
+        entry.captionSourceIndex
+      );
+      return wrapper;
+    }
+
+    if (entry.type === "table") {
+      const tableContext = target.context?.environment?.match?.(/^table\*?$/i)
+        ? popupTableContext(target, source)
+        : target.context;
+      if (!tableContext) throw new Error("Table body is unavailable.");
+      const prepared = contextTools.prepareDocumentCommands(
+        source,
+        target.sourceIndex,
+        tableContext.source
+      );
+      const rendered = tableRenderer.renderTable({ ...tableContext, source: prepared.body }, {
+        commandSide: null,
+        includeCaret: false,
+        contextTools,
+        document,
+        katex,
+        macros: prepared.macros,
+        trust: trustedKatexCommand
+      });
+      if (!rendered) throw new Error("Table preview is empty.");
+      body.appendChild(rendered);
+      appendStructureHoverCaption(
+        body,
+        source,
+        target.sourceIndex,
+        entry.caption || target.caption || "",
+        entry.captionSourceIndex
+      );
+      return wrapper;
+    }
+
+    const context = target.context;
+    const numbering = target.numbering || contextTools.equationPreviewNumbering?.(source, context);
+    const equationBody = contextTools.previewBody(context, null, numbering, false);
+    const prepared = contextTools.prepareDocumentCommands(source, target.sourceIndex, equationBody);
+    const equation = document.createElement("div");
+    equation.className = "smarttex-structure-hover-equation-render";
+    katex.render(prepared.body, equation, {
+      displayMode: true,
+      throwOnError: false,
+      strict: "ignore",
+      trust: trustedKatexCommand,
+      maxExpand: 1000,
+      maxSize: 25,
+      macros: {
+        ...prepared.macros,
+        "\\label": { tokens: [], numArgs: 1 },
+        "\\nonumber": "",
+        "\\notag": ""
+      }
+    });
+    body.appendChild(equation);
+    return wrapper;
+  }
+
+  async function buildFileTreeHoverPreview(item) {
+    const path = String(
+      item?.getAttribute("data-path") ||
+      item?.getAttribute("data-file-path") ||
+      item?.getAttribute("aria-label") ||
+      item?.querySelector(".item-name-button span, .item-name span, .entity-name span")?.textContent ||
+      ""
+    ).trim();
+    const wrapper = document.createElement("div");
+    wrapper.className = "smarttex-structure-hover-content smarttex-structure-hover-file";
+    const title = document.createElement("div");
+    title.className = "smarttex-structure-hover-title";
+    title.textContent = path.replace(/\\/g, "/").split("/").pop() || "Figure";
+    const body = document.createElement("div");
+    body.className = "smarttex-structure-hover-body smarttex-structure-hover-file-body";
+    body.appendChild(await resolveStructureHoverMedia(path));
+    wrapper.append(title, body);
+    return wrapper;
+  }
+
+  function fileTreeHoverCacheKey(item) {
+    const path = String(
+      item?.getAttribute("data-path") ||
+      item?.getAttribute("data-file-path") ||
+      item?.getAttribute("aria-label") ||
+      item?.querySelector(".item-name-button span, .item-name span, .entity-name span")?.textContent ||
+      ""
+    ).trim();
+    const directUrl = directFigureFile(path)?.url || "";
+    return `file::${path}::${directUrl}`;
+  }
+
+  async function cachedFileTreeHoverPreview(item) {
+    const key = fileTreeHoverCacheKey(item);
+    const cached = lruCacheGet(structureHoverRenderCache, key);
+    if (cached) {
+      const clone = htmlNodeClone(cached);
+      if (clone) return clone;
+    }
+    const built = await buildFileTreeHoverPreview(item);
+    if (built?.outerHTML) {
+      lruCacheSet(structureHoverRenderCache, key, built.outerHTML, STRUCTURE_HOVER_CACHE_LIMIT);
+    }
+    return built;
+  }
+
+  function scheduleStructureHoverPreview(anchor, builder, pointerEvent = null) {
+    if (!(anchor instanceof Element) || typeof builder !== "function") return;
+    updateStructureHoverPointer(pointerEvent);
+    if (structureHoverPreviewTimer !== null) window.clearTimeout(structureHoverPreviewTimer);
+    const generation = ++structureHoverPreviewGeneration;
+    structureHoverPreviewAnchor = anchor;
+    const popup = ensureStructureHoverPreview();
+    popup.hidden = true;
+    structureHoverPreviewTimer = window.setTimeout(async () => {
+      structureHoverPreviewTimer = null;
+      try {
+        if (generation !== structureHoverPreviewGeneration || structureHoverPreviewAnchor !== anchor || !anchor.isConnected) return;
+        showStructureHoverSpinner();
+        // Let the spinner paint before decoding images or invoking KaTeX/table
+        // rendering. Pointer movement continues to update its position.
+        await new Promise((resolve) => window.requestAnimationFrame(resolve));
+        const content = await builder();
+        if (generation !== structureHoverPreviewGeneration || structureHoverPreviewAnchor !== anchor || !anchor.isConnected) {
+          hideStructureHoverSpinner();
+          return;
+        }
+        popup.replaceChildren(content);
+        popup.classList.add("smarttex-structure-hover-preview-measuring");
+        popup.hidden = false;
+        popup.setAttribute("aria-hidden", "false");
+        await new Promise((resolve) => window.requestAnimationFrame(resolve));
+        if (generation !== structureHoverPreviewGeneration || structureHoverPreviewAnchor !== anchor || !anchor.isConnected) {
+          hideStructureHoverPreview({ invalidate: false });
+          return;
+        }
+        positionStructureHoverPreview(anchor, popup);
+        popup.classList.remove("smarttex-structure-hover-preview-measuring");
+        hideStructureHoverSpinner();
+      } catch (_error) {
+        if (generation === structureHoverPreviewGeneration) hideStructureHoverPreview({ invalidate: false });
+      }
+    }, STRUCTURE_HOVER_PREVIEW_DELAY_MS);
+  }
+
+  async function cachedNumberedOutlineHoverPreview(entry) {
+    const key = structureHoverCacheKey(entry);
+    const cached = lruCacheGet(structureHoverRenderCache, key);
+    if (cached) {
+      const clone = htmlNodeClone(cached);
+      if (clone) return clone;
+    }
+    const built = await buildNumberedOutlineHoverPreview(entry);
+    if (built?.outerHTML) {
+      lruCacheSet(
+        structureHoverRenderCache,
+        key,
+        built.outerHTML,
+        STRUCTURE_HOVER_CACHE_LIMIT
+      );
+    }
+    return built;
+  }
+
+  function scheduleNumberedOutlineHoverPreview(link, entry, pointerEvent = null) {
+    scheduleStructureHoverPreview(link, () => cachedNumberedOutlineHoverPreview(entry), pointerEvent);
+  }
+
+  function fileTreeGraphicItemFromNode(node) {
+    const item = node?.closest?.('.file-tree-list [role="treeitem"]');
+    if (!(item instanceof Element)) return null;
+    if (item.classList.contains("smarttex-figure-tree-item")) return item;
+    const name = String(
+      item.getAttribute("data-path") ||
+      item.getAttribute("data-file-path") ||
+      item.getAttribute("aria-label") ||
+      item.querySelector(".item-name-button span, .item-name span, .entity-name span")?.textContent ||
+      ""
+    );
+    return /\.(?:png|jpe?g|gif|webp|svg|pdf|eps|bmp|tiff?)$/i.test(name.trim()) ? item : null;
+  }
+
+  function numberedOutlineSectionCollapseKey(section, state = currentState) {
+    const fileName = String(state?.fileName || "");
+    const level = Math.max(0, Number(section?.level) || 0);
+    const number = String(section?.number || "").trim();
+    const title = normalizedOutlineText(section?.title);
+    const sourceIndex = Math.max(0, Number(section?.sourceIndex) || 0);
+    return [fileName, level, number, title, sourceIndex].join("|");
+  }
+
+  function numberedOutlineEntriesForState(state = currentState) {
+    const source = String(state?.value || "");
+    const fileName = String(state?.fileName || "");
+    if (
+      source === numberedOutlineCacheSource &&
+      fileName === numberedOutlineCacheFileName
+    ) {
+      return numberedOutlineCacheEntries;
+    }
+    numberedOutlineCacheSource = source;
+    numberedOutlineCacheFileName = fileName;
+    numberedOutlineCacheEntries = contextTools.numberedOutlineElements?.(source) || [];
+    return numberedOutlineCacheEntries;
+  }
+
+  function numberedOutlineEntryText(entry) {
+    const label = String(entry?.label || "").trim();
+    const number = String(entry?.number || "?").trim() || "?";
+    const prefix = entry?.type === "figure"
+      ? `Fig. ${number}`
+      : entry?.type === "table"
+        ? `Table ${number}`
+        : `Eq. (${number})`;
+    return label ? `${prefix}: [${label}]` : prefix;
+  }
+
+  function numberedOutlineEntryTitle(entry) {
+    const text = numberedOutlineEntryText(entry);
+    const caption = String(entry?.caption || "").replace(/\s+/g, " ").trim();
+    return caption ? `${text} — ${caption}` : `${text} — jump to source`;
+  }
+
+  function numberedOutlineSignature(entries) {
+    return entries.map((entry) => [
+      entry.type,
+      entry.number,
+      entry.label,
+      entry.sourceIndex
+    ].join(":" )).join("|");
+  }
+
+  function clearNumberedOutlinePendingCursor() {
+    if (numberedOutlinePendingCursorTimer !== null) {
+      window.clearTimeout(numberedOutlinePendingCursorTimer);
+      numberedOutlinePendingCursorTimer = null;
+    }
+    numberedOutlinePendingCursorIndex = null;
+  }
+
+  function setNumberedOutlinePendingCursor(indexValue) {
+    clearNumberedOutlinePendingCursor();
+    numberedOutlinePendingCursorIndex = Math.max(0, Number(indexValue) || 0);
+    numberedOutlinePendingCursorTimer = window.setTimeout(() => {
+      numberedOutlinePendingCursorTimer = null;
+      numberedOutlinePendingCursorIndex = null;
+      updateNumberedOutlineActiveIndicator();
+    }, 900);
+  }
+
+  function numberedOutlineHorizontalScrollSnapshot(body) {
+    // CollabTeX may place horizontal overflow on the outline body, an inner tree
+    // wrapper, or the pane itself depending on deployment/version. Capture every
+    // ancestor inside the outline pane rather than assuming a single scroll owner.
+    // The numbered labels are intentionally ellipsized; a navigation click must not
+    // pan any of these containers sideways just because scrollIntoView() wants to
+    // reveal the hidden tail of a long label.
+    if (!(body instanceof Element)) return [];
+    const pane = body.closest(".outline-pane");
+    const snapshot = [];
+    let node = body;
+    while (node instanceof HTMLElement) {
+      snapshot.push({ element: node, left: Number(node.scrollLeft) || 0 });
+      if (node === pane) break;
+      node = node.parentElement;
+    }
+    return snapshot;
+  }
+
+  function restoreNumberedOutlineHorizontalScroll(snapshot) {
+    for (const entry of snapshot || []) {
+      if (!(entry?.element instanceof HTMLElement) || !entry.element.isConnected) continue;
+      entry.element.scrollLeft = Number(entry.left) || 0;
+    }
+  }
+
+  function preserveNumberedOutlineHorizontalScroll(body, action) {
+    const snapshot = numberedOutlineHorizontalScrollSnapshot(body);
+    const result = typeof action === "function" ? action() : undefined;
+    restoreNumberedOutlineHorizontalScroll(snapshot);
+    // CollabTeX's outline highlight is React-owned and can commit after SmartTeX's
+    // synchronous click handler. Restore once more on the next paint so that late
+    // focus/scrollIntoView work cannot move the pane horizontally after the click.
+    window.requestAnimationFrame?.(() => restoreNumberedOutlineHorizontalScroll(snapshot));
+    return { result, snapshot };
+  }
+
+  function jumpFromNumberedOutline(entry) {
+    const sourceIndex = Math.max(0, Number(entry?.sourceIndex) || 0);
+    const body = document.querySelector(".outline-pane .outline-body");
+    const horizontalSnapshot = numberedOutlineHorizontalScrollSnapshot(body);
+    announceNavigationOrigin(sourceIndex);
+    // Move the outline indicator synchronously. CollabTeX updates its own
+    // highlighted section only after its editor-selection observer runs; the
+    // SmartTeX row should become current at the instant it is clicked.
+    setNumberedOutlinePendingCursor(sourceIndex);
+    preserveNumberedOutlineHorizontalScroll(body, () => {
+      updateNumberedOutlineActiveIndicator(sourceIndex);
+    });
+    window.requestAnimationFrame?.(() => {
+      preserveNumberedOutlineHorizontalScroll(body, () => {
+        updateNumberedOutlineActiveIndicator(sourceIndex);
+      });
+    });
+    bridgeRequest("setCursor", {
+      index: sourceIndex,
+      focus: true
+    }).then(() => {
+      // Focusing the editor can trigger a delayed native-outline reconciliation.
+      // Preserve the exact pre-click horizontal position across that final commit.
+      restoreNumberedOutlineHorizontalScroll(horizontalSnapshot);
+      window.requestAnimationFrame?.(() => {
+        restoreNumberedOutlineHorizontalScroll(horizontalSnapshot);
+      });
+    }).catch((error) => {
+      restoreNumberedOutlineHorizontalScroll(horizontalSnapshot);
+      clearNumberedOutlinePendingCursor();
+      updateNumberedOutlineActiveIndicator();
+      console.warn("SmartTeX could not navigate from the file outline:", error);
+    });
+  }
+
+  function numberedOutlineSectionGroups(state = currentState) {
+    const source = String(state?.value || "");
+    const entries = numberedOutlineEntriesForState(state);
+    const sections = contextTools.sectionNumbering?.(source) || [];
+    const groups = new Map();
+    const topLevel = [];
+    const active = [];
+    let sectionCursor = 0;
+
+    for (const entry of entries) {
+      const entryIndex = Math.max(0, Number(entry?.sourceIndex) || 0);
+      while (
+        sectionCursor < sections.length &&
+        (Number(sections[sectionCursor]?.sourceIndex) || 0) <= entryIndex
+      ) {
+        const section = sections[sectionCursor];
+        const level = Math.max(0, Number(section?.level) || 0);
+        active.length = level;
+        active[level] = section;
+        sectionCursor += 1;
+      }
+      const owner = active.filter(Boolean).at(-1) || null;
+      if (!owner) {
+        topLevel.push(entry);
+        continue;
+      }
+      const key = String(Math.max(0, Number(owner.sourceIndex) || 0));
+      if (!groups.has(key)) groups.set(key, { section: owner, entries: [] });
+      groups.get(key).entries.push(entry);
+    }
+    return { sections, groups, topLevel };
+  }
+
+  function normalizedOutlineText(value) {
+    return String(value || "")
+      .replace(/\s+/g, " ")
+      .replace(/[\u200b-\u200d\ufeff]/g, "")
+      .trim();
+  }
+
+  function nativeOutlineItemControl(item) {
+    if (!(item instanceof Element)) return null;
+    return item.querySelector(
+      ":scope > button, :scope > a, :scope > [role='button'], " +
+      ":scope > div > button, :scope > div > a, :scope > div > [role='button']"
+    );
+  }
+
+  function nativeOutlineItemText(item) {
+    if (!(item instanceof Element)) return "";
+    const ownControl = nativeOutlineItemControl(item);
+    if (ownControl) return normalizedOutlineText(ownControl.textContent);
+
+    const clone = item.cloneNode(true);
+    clone.querySelectorAll?.(".smarttex-numbered-outline-list").forEach((node) => node.remove());
+    clone.querySelectorAll?.("ul, ol, [role='group']").forEach((node) => node.remove());
+    return normalizedOutlineText(clone.textContent);
+  }
+
+  function nativeOutlineItems(body) {
+    const selectors = [
+      ".outline-item",
+      "[role='treeitem']",
+      "li",
+      "[data-testid*='outline']"
+    ];
+    const seen = new Set();
+    const items = [];
+    for (const selector of selectors) {
+      for (const candidate of body.querySelectorAll(selector)) {
+        if (!(candidate instanceof Element)) continue;
+        const item = candidate.matches("button, a, [role='button']")
+          ? candidate.closest(".outline-item, [role='treeitem'], li") || candidate.parentElement
+          : candidate;
+        if (
+          !(item instanceof Element) ||
+          item.closest(".smarttex-numbered-outline-list") ||
+          seen.has(item)
+        ) continue;
+        seen.add(item);
+        items.push(item);
+      }
+    }
+    return items;
+  }
+
+  function outlineSectionMatchesItem(section, item) {
+    const title = normalizedOutlineText(section?.title);
+    if (!title) return false;
+    const text = nativeOutlineItemText(item);
+    if (!text) return false;
+    if (text === title) return true;
+
+    const number = normalizedOutlineText(section?.number);
+    const candidates = [
+      number ? `${number} ${title}` : "",
+      number ? `${number}. ${title}` : "",
+      number ? `${number}\u00a0${title}` : ""
+    ].filter(Boolean);
+    return candidates.some((candidate) => text === normalizedOutlineText(candidate)) ||
+      text.endsWith(` ${title}`);
+  }
+
+  function findNativeOutlineSectionItem(body, section, usedItems) {
+    const items = nativeOutlineItems(body);
+    for (const item of items) {
+      if (usedItems.has(item)) continue;
+      if (outlineSectionMatchesItem(section, item)) return item;
+    }
+    return null;
+  }
+
+  function restoreSuppressedNativeOutlineHighlight(body) {
+    if (!(body instanceof Element)) return;
+    for (const control of body.querySelectorAll("[data-smarttex-outline-highlight-suppressed='true']")) {
+      if (control.closest(".smarttex-numbered-outline-list")) continue;
+      control.classList.add("outline-item-link-highlight");
+      delete control.dataset.smarttexOutlineHighlightSuppressed;
+    }
+    for (const item of body.querySelectorAll("[data-smarttex-outline-current-suppressed='true']")) {
+      if (item.closest(".smarttex-numbered-outline-list")) continue;
+      item.setAttribute("aria-current", "true");
+      delete item.dataset.smarttexOutlineCurrentSuppressed;
+    }
+  }
+
+  function suppressNativeOutlineHighlight(body) {
+    if (!(body instanceof Element)) return;
+    for (const control of body.querySelectorAll(".outline-item-link.outline-item-link-highlight")) {
+      if (control.closest(".smarttex-numbered-outline-list")) continue;
+      control.classList.remove("outline-item-link-highlight");
+      control.dataset.smarttexOutlineHighlightSuppressed = "true";
+    }
+    for (const item of body.querySelectorAll("[role='treeitem'][aria-current='true']")) {
+      if (item.closest(".smarttex-numbered-outline-list")) continue;
+      item.setAttribute("aria-current", "false");
+      item.dataset.smarttexOutlineCurrentSuppressed = "true";
+    }
+  }
+
+  function numberedOutlineLinkForEntry(body, entry) {
+    if (!(body instanceof Element)) return null;
+    const sourceIndex = String(Math.max(0, Number(entry?.sourceIndex) || 0));
+    const links = body.querySelectorAll(".smarttex-numbered-outline-link[data-smarttex-source-index]");
+    for (const link of links) {
+      if (link.dataset.smarttexSourceIndex !== sourceIndex) continue;
+      const list = link.closest(".smarttex-numbered-outline-list");
+      if (list?.hidden) return null;
+      return link;
+    }
+    return null;
+  }
+
+  function numberedOutlineActiveEntryForCursor(cursorValue, state = currentState, body = null) {
+    const cursorIndex = Math.max(0, Number(cursorValue) || 0);
+    const sections = contextTools.sectionNumbering?.(String(state?.value || "")) || [];
+    const entries = numberedOutlineEntriesForState(state);
+    let latestSectionIndex = -1;
+    for (const section of sections) {
+      const sectionIndex = Math.max(0, Number(section?.sourceIndex) || 0);
+      if (sectionIndex > cursorIndex) break;
+      latestSectionIndex = sectionIndex;
+    }
+
+    let activeEntry = null;
+    for (const entry of entries) {
+      const entryIndex = Math.max(0, Number(entry?.sourceIndex) || 0);
+      if (entryIndex > cursorIndex) break;
+      // A newer section/subsection supersedes numbered items from the previous
+      // structural scope. Within the current scope, the last visible numbered
+      // item becomes the deepest outline target.
+      if (entryIndex < latestSectionIndex) continue;
+      if (body && !numberedOutlineLinkForEntry(body, entry)) continue;
+      activeEntry = entry;
+    }
+    return activeEntry;
+  }
+
+  function updateNumberedOutlineActiveIndicator(cursorOverride = null) {
+    const body = document.querySelector(".outline-pane .outline-body");
+    if (!(body instanceof Element)) return;
+
+    for (const link of body.querySelectorAll(".smarttex-numbered-outline-link")) {
+      link.classList.remove("smarttex-numbered-outline-link-active", "outline-item-link-highlight");
+      link.removeAttribute("aria-current");
+    }
+
+    // Undo only the native highlight state SmartTeX suppressed on the previous
+    // pass. If there is a new active numbered row it is suppressed again below.
+    restoreSuppressedNativeOutlineHighlight(body);
+
+    const effectiveCursor = cursorOverride !== null && cursorOverride !== undefined
+      ? Math.max(0, Number(cursorOverride) || 0)
+      : numberedOutlinePendingCursorIndex !== null
+        ? numberedOutlinePendingCursorIndex
+        : Math.max(0, Number(currentState?.cursorIndex) || 0);
+    const entry = numberedOutlineActiveEntryForCursor(effectiveCursor, currentState, body);
+    if (!entry) {
+      numberedOutlineActiveSourceIndex = null;
+      return;
+    }
+
+    const link = numberedOutlineLinkForEntry(body, entry);
+    if (!(link instanceof Element)) {
+      numberedOutlineActiveSourceIndex = null;
+      return;
+    }
+
+    // Reuse CollabTeX's own highlight class so the numbered row receives the
+    // exact same current-location treatment as a native section heading.
+    suppressNativeOutlineHighlight(body);
+    link.classList.add("smarttex-numbered-outline-link-active", "outline-item-link-highlight");
+    link.setAttribute("aria-current", "location");
+
+    const sourceIndex = Math.max(0, Number(entry.sourceIndex) || 0);
+    if (numberedOutlineActiveSourceIndex !== sourceIndex) {
+      numberedOutlineActiveSourceIndex = sourceIndex;
+      // Vertical auto-scrolling is useful when the active numbered item is outside
+      // the visible outline viewport, but horizontal panning is never useful because
+      // labels are intentionally single-line with ellipsis. Preserve all horizontal
+      // outline scroll offsets around scrollIntoView(), including the next paint.
+      preserveNumberedOutlineHorizontalScroll(body, () => {
+        link.scrollIntoView?.({ block: "nearest", inline: "nearest" });
+      });
+    }
+  }
+
+  function scheduleNumberedOutlineActiveIndicator() {
+    updateNumberedOutlineActiveIndicator();
+    // CollabTeX's React outline may commit its native section highlight just
+    // after the editor state event. Re-apply on the next paint so the current
+    // marker remains on the deeper SmartTeX numbered row instead of briefly
+    // returning to the containing subsection.
+    window.requestAnimationFrame?.(() => updateNumberedOutlineActiveIndicator());
+  }
+
+  function setNumberedOutlineCollapsed(toggle, list, collapsed) {
+    if (!(list instanceof Element)) return;
+    list.hidden = Boolean(collapsed);
+    if (!(toggle instanceof Element)) return;
+    toggle.classList.toggle("smarttex-numbered-outline-toggle-collapsed", Boolean(collapsed));
+    toggle.dataset.smarttexCollapsed = collapsed ? "true" : "false";
+    toggle.title = collapsed ? "Show numbered elements" : "Hide numbered elements";
+    toggle.setAttribute("aria-expanded", collapsed ? "false" : "true");
+  }
+
+  function attachNumberedOutlineToggle(nativeItem, section, list) {
+    const control = nativeOutlineItemControl(nativeItem);
+    if (!(control instanceof Element)) return null;
+
+    const collapseKey = numberedOutlineSectionCollapseKey(section);
+    const toggle = document.createElement("span");
+    toggle.className = "smarttex-numbered-outline-toggle";
+    toggle.dataset.smarttexSectionCollapseKey = collapseKey;
+    toggle.setAttribute("aria-hidden", "true");
+
+    const collapsed = numberedOutlineCollapsedSections.has(collapseKey);
+    setNumberedOutlineCollapsed(toggle, list, collapsed);
+
+    const stopNativeOutlineActivation = (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+    };
+    toggle.addEventListener("pointerdown", stopNativeOutlineActivation);
+    toggle.addEventListener("mousedown", stopNativeOutlineActivation);
+    toggle.addEventListener("click", (event) => {
+      stopNativeOutlineActivation(event);
+      const nextCollapsed = !list.hidden;
+      if (nextCollapsed) numberedOutlineCollapsedSections.add(collapseKey);
+      else numberedOutlineCollapsedSections.delete(collapseKey);
+      setNumberedOutlineCollapsed(toggle, list, nextCollapsed);
+      scheduleNumberedOutlineActiveIndicator();
+    });
+
+    // Keep the disclosure arrow visually inside the native section header,
+    // but do not add another button/treeitem/role that CollabTeX could mistake
+    // for a real outline node when it determines the current section.
+    control.prepend(toggle);
+    return toggle;
+  }
+
+  function createNumberedOutlineList(entries, section = null) {
+    // Deliberately use plain divs rather than ul/li/treeitem/button elements.
+    // CollabTeX's outline code scans those native structures to determine the
+    // active section; SmartTeX rows must not participate in that indexing.
+    const list = document.createElement("div");
+    list.className = "smarttex-numbered-outline-list";
+    if (section) {
+      list.dataset.smarttexSectionIndex = String(Math.max(0, Number(section.sourceIndex) || 0));
+      list.dataset.smarttexSectionLevel = String(Math.max(0, Number(section.level) || 0));
+    } else {
+      list.classList.add("smarttex-numbered-outline-root");
+    }
+
+    for (const entry of entries) {
+      const item = document.createElement("div");
+      item.className = `smarttex-numbered-outline-item smarttex-numbered-outline-${entry.type}`;
+
+      const link = document.createElement("div");
+      link.className = "smarttex-numbered-outline-link outline-item-link";
+      link.setAttribute("aria-label", numberedOutlineEntryTitle(entry));
+      link.dataset.smarttexSourceIndex = String(Math.max(0, Number(entry.sourceIndex) || 0));
+
+      const number = document.createElement("span");
+      number.className = "smarttex-numbered-outline-number";
+      number.textContent = entry.type === "figure"
+        ? `Fig. ${entry.number}`
+        : entry.type === "table"
+          ? `Table ${entry.number}`
+          : `Eq. (${entry.number})`;
+      link.appendChild(number);
+
+      if (entry.label) {
+        const separator = document.createElement("span");
+        separator.className = "smarttex-numbered-outline-separator";
+        separator.textContent = ":";
+        const label = document.createElement("span");
+        label.className = "smarttex-numbered-outline-label";
+        label.textContent = `[${entry.label}]`;
+        link.append(separator, label);
+      }
+
+      link.addEventListener("pointerenter", (event) => {
+        updateStructureHoverPointer(event);
+        scheduleNumberedOutlineHoverPreview(link, entry, event);
+      });
+      link.addEventListener("pointerleave", () => {
+        hideStructureHoverPreview();
+      });
+      link.addEventListener("pointerdown", (event) => {
+        hideStructureHoverPreview();
+        // Prevent the native outline header from receiving activation/focus.
+        event.stopPropagation();
+      });
+      link.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        jumpFromNumberedOutline(entry);
+      });
+      item.appendChild(link);
+      list.appendChild(item);
+    }
+    return list;
+  }
+
+  function renderNumberedOutlineNow() {
+    const body = document.querySelector(".outline-pane .outline-body");
+    if (!body || !currentState?.value) return;
+
+    const entries = numberedOutlineEntriesForState(currentState);
+    const signature = numberedOutlineSignature(entries);
+    const { groups, topLevel } = numberedOutlineSectionGroups(currentState);
+    const expectedSectionKeys = [...groups.keys()];
+    const hasCompleteMerge = (
+      body.dataset.smarttexNumberedOutlineSignature === signature &&
+      (!topLevel.length || body.querySelector(
+        ":scope > .smarttex-numbered-outline-list.smarttex-numbered-outline-root"
+      )) &&
+      expectedSectionKeys.every((key) => (
+        body.querySelector(
+          `.smarttex-numbered-outline-list[data-smarttex-section-index="${CSS.escape(key)}"]`
+        ) &&
+        body.querySelector(
+          `.smarttex-numbered-outline-toggle[data-smarttex-section-index="${CSS.escape(key)}"]`
+        )
+      ))
+    );
+    if (hasCompleteMerge) {
+      updateNumberedOutlineActiveIndicator();
+      return;
+    }
+
+    body.querySelectorAll(".smarttex-numbered-outline-list").forEach((node) => node.remove());
+    body.querySelectorAll(".smarttex-numbered-outline-toggle").forEach((node) => node.remove());
+    delete body.dataset.smarttexNumberedOutlineSignature;
+    if (!entries.length) {
+      updateNumberedOutlineActiveIndicator();
+      return;
+    }
+
+    const usedItems = new Set();
+
+    if (topLevel.length) {
+      body.prepend(createNumberedOutlineList(topLevel));
+    }
+
+    for (const { section, entries: sectionEntries } of groups.values()) {
+      const nativeItem = findNativeOutlineSectionItem(body, section, usedItems);
+      if (!nativeItem) continue;
+      usedItems.add(nativeItem);
+      const list = createNumberedOutlineList(sectionEntries, section);
+      const nestedStructure = nativeItem.querySelector(
+        ":scope > ul:not(.smarttex-numbered-outline-list), " +
+        ":scope > ol:not(.smarttex-numbered-outline-list), " +
+        ":scope > [role='group']:not(.smarttex-numbered-outline-list)"
+      );
+      nativeItem.insertBefore(list, nestedStructure || null);
+      const toggle = attachNumberedOutlineToggle(nativeItem, section, list);
+      if (toggle) {
+        toggle.dataset.smarttexSectionIndex = String(
+          Math.max(0, Number(section.sourceIndex) || 0)
+        );
+      }
+    }
+
+    body.dataset.smarttexNumberedOutlineSignature = signature;
+    updateNumberedOutlineActiveIndicator();
+  }
+
+  function renderNumberedOutline() {
+    numberedOutlineUpdateTimer = null;
+    try {
+      if (interactionTasks?.runSync) {
+        interactionTasks.runSync("numbered-outline-render", renderNumberedOutlineNow);
+      } else {
+        renderNumberedOutlineNow();
+      }
+    } catch (error) {
+      if (interactionTasks?.isAbortError?.(error)) {
+        scheduleNumberedOutlineUpdate(500);
+        return;
+      }
+      throw error;
+    }
+  }
+
+  function scheduleNumberedOutlineUpdate(delay = 80) {
+    if (numberedOutlineUpdateTimer !== null) {
+      window.clearTimeout(numberedOutlineUpdateTimer);
+    }
+    numberedOutlineUpdateTimer = window.setTimeout(
+      renderNumberedOutline,
+      Math.max(
+        Math.max(0, Number(delay) || 0),
+        Number(interactionTasks?.keyboardIdleRemaining?.()) || 0
+      )
+    );
+  }
+
+  function ensureNumberedOutlineObserver() {
+    const pane = document.querySelector(".outline-pane");
+    if (pane && pane !== numberedOutlineObservedPane) {
+      numberedOutlinePaneObserver?.disconnect();
+      numberedOutlineObservedPane = pane;
+      numberedOutlinePaneObserver = new MutationObserver(() => {
+        scheduleNumberedOutlineUpdate(40);
+      });
+      numberedOutlinePaneObserver.observe(pane, { childList: true, subtree: true });
+      scheduleNumberedOutlineUpdate(0);
+    }
+    if (pane) {
+      numberedOutlineDiscoveryObserver?.disconnect();
+      numberedOutlineDiscoveryObserver = null;
+      return;
+    }
+    if (!numberedOutlineDiscoveryObserver && document.body) {
+      numberedOutlineDiscoveryObserver = new MutationObserver(() => {
+        if (document.querySelector(".outline-pane")) ensureNumberedOutlineObserver();
+      });
+      numberedOutlineDiscoveryObserver.observe(document.body, { childList: true, subtree: true });
+    }
+  }
+
   function previewStateForRender() {
     return environmentPopupUsesHover() && hoverPreviewState
       ? hoverPreviewState
@@ -745,10 +2233,41 @@
     return { left: Math.max(8, window.innerWidth - 42), top: 17 };
   }
 
-  function showPopupLoadingSpinner(_event, _anchor = null) {
+  function popupSpinnerAnchorPosition(event = null, anchor = null) {
+    const clientX = Number(event?.clientX);
+    const clientY = Number(event?.clientY);
+    if (Number.isFinite(clientX) && Number.isFinite(clientY)) {
+      return { left: clientX - 9, top: clientY - 9 };
+    }
+
+    const candidate = anchor?.getBoundingClientRect?.() || anchor;
+    if (candidate) {
+      const pageX = Number(candidate.pageX);
+      const pageY = Number(candidate.pageY);
+      if (Number.isFinite(pageX) && Number.isFinite(pageY)) {
+        return {
+          left: pageX - window.scrollX - 9,
+          top: pageY - window.scrollY - 9
+        };
+      }
+      const left = Number(candidate.left);
+      const top = Number(candidate.top);
+      if (Number.isFinite(left) && Number.isFinite(top)) {
+        const width = Math.max(0, Number(candidate.width) || 0);
+        const height = Math.max(0, Number(candidate.height) || 0);
+        return {
+          left: left + width / 2 - 9,
+          top: top + height / 2 - 9
+        };
+      }
+    }
+    return null;
+  }
+
+  function showPopupLoadingSpinner(event, anchor = null) {
     if (!popupInteractionReady()) return null;
     const spinner = ensurePopupLoadingSpinner();
-    const position = popupSpinnerButtonPosition();
+    const position = popupSpinnerAnchorPosition(event, anchor) || popupSpinnerButtonPosition();
     const generation = ++popupLoadingSpinnerGeneration;
     spinner.style.left = `${Math.round(position.left)}px`;
     spinner.style.top = `${Math.round(position.top)}px`;
@@ -766,6 +2285,72 @@
     if (popupLoadingSpinner) popupLoadingSpinner.hidden = true;
   }
 
+  function ensureEnvironmentPopupLoadingSpinner() {
+    if (environmentPopupLoadingSpinner?.isConnected) return environmentPopupLoadingSpinner;
+    environmentPopupLoadingSpinner = document.createElement("span");
+    environmentPopupLoadingSpinner.className =
+      "smarttex-popup-loading-spinner smarttex-environment-popup-loading-spinner";
+    environmentPopupLoadingSpinner.hidden = true;
+    environmentPopupLoadingSpinner.setAttribute("role", "status");
+    environmentPopupLoadingSpinner.setAttribute("aria-label", "Opening preview");
+    document.body.appendChild(environmentPopupLoadingSpinner);
+    return environmentPopupLoadingSpinner;
+  }
+
+  function showEnvironmentPopupLoadingSpinner(anchor = null) {
+    if (!popupInteractionReady()) return null;
+    const spinner = ensureEnvironmentPopupLoadingSpinner();
+    const position = popupSpinnerAnchorPosition(null, anchor) || popupSpinnerButtonPosition();
+    const generation = ++environmentPopupLoadingSpinnerGeneration;
+    spinner.style.left = `${Math.round(position.left)}px`;
+    spinner.style.top = `${Math.round(position.top)}px`;
+    spinner.hidden = false;
+    return generation;
+  }
+
+  function hideEnvironmentPopupLoadingSpinner(generation = null) {
+    if (
+      generation !== null &&
+      generation !== undefined &&
+      generation !== environmentPopupLoadingSpinnerGeneration
+    ) return;
+    environmentPopupLoadingSpinnerGeneration += 1;
+    if (environmentPopupLoadingSpinner) environmentPopupLoadingSpinner.hidden = true;
+  }
+
+  function equationPreviewIsSingleLine(context, renderedRoot = null) {
+    if (!context || context.kind === "table" || context.kind === "figure") return false;
+
+    const source = String(context.source || "");
+    // Explicit TeX row breaks always make the rendered equation multi-line,
+    // irrespective of the surrounding math environment. This also catches
+    // nested aligned/gathered/matrix-style constructs with multiple rows.
+    if (/\\\\/.test(source) || /\\(?:newline|linebreak)\b/.test(source)) {
+      return false;
+    }
+
+    if (renderedRoot?.querySelectorAll) {
+      // KaTeX represents aligned, gathered, cases, arrays and matrices as
+      // mtables. More than one rendered row is definitive evidence that the
+      // equation is not a one-liner. A one-row aligned environment is still
+      // allowed to use the wider popup.
+      const rowCount = renderedRoot.querySelectorAll(".mtable .mtr").length;
+      if (rowCount > 1) return false;
+    }
+
+    return true;
+  }
+
+  function updateEquationPreviewLineMode(context, renderedRoot = null) {
+    if (!context || context.kind === "table" || context.kind === "figure") {
+      delete preview.dataset.smarttexEquationSingleLine;
+      return false;
+    }
+    const singleLine = equationPreviewIsSingleLine(context, renderedRoot);
+    preview.dataset.smarttexEquationSingleLine = singleLine ? "true" : "false";
+    return singleLine;
+  }
+
   function applyPreviewPresentation(context) {
     const isTable = context?.kind === "table";
     const isFigure = context?.kind === "figure";
@@ -774,6 +2359,7 @@
     if (previewZoomKind !== nextKind) {
       previewZoomKind = nextKind;
       previewZoom = 1;
+      previewAutoFitZoom = 1;
     }
     previewPopupUI?.setType(isFigure ? "image" : isTable ? "table" : "equation");
     previewTitle.textContent = isFigure
@@ -789,16 +2375,23 @@
           ? "Live table preview"
           : "Live equation preview"
     );
+    // Set a source-level line-mode immediately so cached previews already use
+    // the correct cap. After KaTeX is mounted this is refined from rendered DOM.
+    updateEquationPreviewLineMode(context);
     refreshPreviewZoom();
   }
 
   function showPreviewLoading(state, context) {
     const generation = ++previewLoadingGeneration;
     const contextId = previewContextId(state, context);
-    const openingNewContext = preview.hidden || contextId !== activeContextId;
+    const openingNewContext = (
+      preview.hidden ||
+      preview.dataset.smarttexStaging === "true" ||
+      contextId !== activeContextId
+    );
     preview.setAttribute("aria-busy", "true");
     if (previewLoadingGlobalGeneration !== null) {
-      hidePopupLoadingSpinner(previewLoadingGlobalGeneration);
+      hideEnvironmentPopupLoadingSpinner(previewLoadingGlobalGeneration);
       previewLoadingGlobalGeneration = null;
     }
     if (openingNewContext) {
@@ -807,26 +2400,38 @@
       previewMeta.hidden = true;
       status.textContent = "";
       status.hidden = true;
-      preview.classList.remove("smarttex-preview-stale");
+      preview.classList.remove(
+        "smarttex-preview-stale",
+        "smarttex-preview-visible",
+        "smarttex-preview-staging"
+      );
+      delete preview.dataset.smarttexStaging;
       caretPlacementState = null;
       lastSuccessfulMarkup = "";
       previewPositioned = false;
+      // The header diagnostic describes how this opening was populated. Reset it
+      // before a new environment opens; revealCachedPreviewMarkup() turns it on
+      // only when cached content actually supplies the opening frame.
+      setPopupOpenedFromCache(false);
+      // Keep the popup completely hidden while its content is prepared. The
+      // only visible feedback during a cold/opening render is the cursor-local
+      // spinner.
+      preview.hidden = true;
+      const loadingAnchor = state?.smarttexHoverPreview === true
+        ? (lastPointerScreen || state?.screen)
+        : state?.screen;
+      previewLoadingGlobalGeneration = showEnvironmentPopupLoadingSpinner(loadingAnchor);
     }
     applyPreviewPresentation(context);
     activePreviewContext = context;
     activePreviewState = state;
-    previewLoadingIndicator.hidden = false;
+    previewLoadingIndicator.hidden = openingNewContext;
     status.hidden = true;
-    preview.hidden = false;
-    preview.classList.add("smarttex-preview-visible");
+    if (!openingNewContext) {
+      preview.hidden = false;
+      preview.classList.add("smarttex-preview-visible");
+    }
     refreshCaptionPreviewLock(state);
-    window.requestAnimationFrame(() => {
-      if (generation !== previewLoadingGeneration || preview.hidden) return;
-      positionPreviewAtCursor({
-        force: openingNewContext,
-        preferPointer: state?.smarttexHoverPreview === true
-      });
-    });
     return generation;
   }
 
@@ -836,7 +2441,7 @@
     preview.removeAttribute("aria-busy");
     previewLoadingIndicator.hidden = true;
     if (previewLoadingGlobalGeneration !== null) {
-      hidePopupLoadingSpinner(previewLoadingGlobalGeneration);
+      hideEnvironmentPopupLoadingSpinner(previewLoadingGlobalGeneration);
       previewLoadingGlobalGeneration = null;
     }
   }
@@ -849,9 +2454,23 @@
     return index >= Number(range.openStart) && index <= Number(range.closeEnd);
   }
 
+  function dismissedRangeContainsState(range, state) {
+    if (!range || !state) return false;
+    if (String(state.fileName || "") !== String(range.fileName || "")) return false;
+    const index = Number(state.cursorIndex);
+    if (!Number.isInteger(index)) return false;
+    const sourceLengthDelta = String(state.value || "").length -
+      Number(range.sourceLength || String(state.value || "").length);
+    const adjustedCloseEnd = Math.max(
+      Number(range.openStart) || 0,
+      (Number(range.closeEnd) || 0) + sourceLengthDelta
+    );
+    return index >= Number(range.openStart) && index <= adjustedCloseEnd;
+  }
+
   function pruneDismissedPreviewContexts(state = previewStateForRender()) {
     for (const [contextId, range] of dismissedPreviewContexts) {
-      if (!contextRangeContainsState(range, state)) {
+      if (!dismissedRangeContainsState(range, state)) {
         dismissedPreviewContexts.delete(contextId);
       }
     }
@@ -859,17 +2478,100 @@
 
   function previewContextIsDismissed(state, context) {
     if (!state || !context) return false;
+    const contextId = previewContextId(state, context);
+    const dismissed = dismissedPreviewContexts.get(contextId);
+    if (dismissed) {
+      const range = contextEnvironmentRange(context);
+      dismissed.openStart = range.openStart;
+      dismissed.closeEnd = range.closeEnd;
+      dismissed.sourceLength = String(state.value || "").length;
+      return true;
+    }
     pruneDismissedPreviewContexts(state);
-    return dismissedPreviewContexts.has(previewContextId(state, context));
+    return false;
+  }
+
+  function stateIsInsideDismissedPreview(state) {
+    if (!state) return false;
+    for (const range of dismissedPreviewContexts.values()) {
+      if (dismissedRangeContainsState(range, state)) return true;
+    }
+    pruneDismissedPreviewContexts(state);
+    return false;
   }
 
 
+  function activeEnvironmentInputTransactionContainsState(state) {
+    const transaction = activeEnvironmentInputTransaction;
+    if (
+      !transaction || !state || preview.hidden ||
+      Date.now() > Number(transaction.expiresAt || 0) ||
+      transaction.contextId !== activeContextId ||
+      String(state.fileName || "") !== transaction.fileName
+    ) {
+      if (transaction && Date.now() > Number(transaction.expiresAt || 0)) {
+        activeEnvironmentInputTransaction = null;
+      }
+      return false;
+    }
+    return true;
+  }
+
+  function refreshCaptionLockFromInputTransaction(state) {
+    const transaction = activeEnvironmentInputTransaction;
+    if (!transaction?.captionLocked || !captionPreviewLock || !state) return false;
+    if (
+      transaction.contextId !== activeContextId ||
+      captionPreviewLock.contextId !== activeContextId ||
+      captionPreviewLock.fileName !== String(state.fileName || "")
+    ) return false;
+    const sourceLength = String(state.value || "").length;
+    const delta = sourceLength - Number(captionPreviewLock.sourceLength || sourceLength);
+    captionPreviewLock.end = Math.max(
+      Number(captionPreviewLock.start) || 0,
+      Number(captionPreviewLock.end) + delta
+    );
+    captionPreviewLock.sourceLength = sourceLength;
+    return true;
+  }
+
   function hidePreview({ clearDismissal = true, force = false } = {}) {
+    // Automatic lifecycle cleanup must never close a popup while the caret is
+    // still inside the environment that owns it. CollabTeX emits independent
+    // focus, scroll, hover and layout notifications around every keypress; any
+    // one of them can otherwise tear down a popup after the live renderer has
+    // already updated it, producing the visible close/reopen cycle. Use the
+    // lightweight range ownership check first so this remains true even while
+    // the edited TeX is temporarily unparsable. Explicit user closes and
+    // settings/feature shutdowns pass force=true and remain authoritative.
+    if (!force && activeEnvironmentInputTransactionContainsState(currentState)) {
+      hidePreviewLoading();
+      return false;
+    }
+    if (!force && activeEnvironmentPreviewContainsState(currentState)) {
+      hidePreviewLoading();
+      return false;
+    }
+    if (!force && liveEquationEditSessionContainsState(currentState)) {
+      hidePreviewLoading();
+      return false;
+    }
     if (!force && captionPreviewIsLocked()) {
       hidePreviewLoading();
       return false;
     }
     captionPreviewLock = null;
+    if (liveCaptionUpdateTimer !== null) {
+      window.clearTimeout(liveCaptionUpdateTimer);
+      liveCaptionUpdateTimer = null;
+    }
+    if (liveEquationUpdateTimer !== null) {
+      window.clearTimeout(liveEquationUpdateTimer);
+      liveEquationUpdateTimer = null;
+    }
+    activeFloatCaptionRenderInfo = null;
+    liveEquationEditSession = null;
+    activeEnvironmentInputTransaction = null;
     hidePreviewLoading();
     if (renderTimer !== null) {
       window.clearTimeout(renderTimer);
@@ -877,7 +2579,17 @@
     }
     renderGeneration += 1;
     preview.hidden = true;
-    preview.classList.remove("smarttex-preview-visible", "smarttex-preview-stale");
+    preview.classList.remove(
+      "smarttex-preview-visible",
+      "smarttex-preview-stale",
+      "smarttex-preview-staging",
+      "smarttex-preview-measuring",
+      "smarttex-preview-intrinsic-measure",
+      "smarttex-preview-scroll-fallback"
+    );
+    previewAutoFitZoom = 1;
+    refreshPreviewZoom();
+    delete preview.dataset.smarttexStaging;
     activeContextId = "";
     caretPlacementState = null;
     lastSuccessfulMarkup = "";
@@ -911,6 +2623,7 @@
         fileName: String(activePreviewState.fileName || ""),
         openStart: range.openStart,
         closeEnd: range.closeEnd,
+        sourceLength: String(activePreviewState.value || "").length,
         hover: activePreviewState.smarttexHoverPreview === true
       });
     }
@@ -979,11 +2692,25 @@
       : null;
   }
 
+  function setCaptionPreviewLockFromCaption(state, context, caption) {
+    const bounds = captionBounds(caption);
+    if (!state || !context || !bounds) return false;
+    const contextId = previewContextId(state, context);
+    captionPreviewLock = {
+      contextId,
+      fileName: String(state.fileName || ""),
+      start: bounds.start,
+      end: bounds.end,
+      sourceLength: String(state.value || "").length
+    };
+    return true;
+  }
+
   function captionPreviewIsLocked() {
     if (
       !captionPreviewLock ||
       preview.hidden ||
-      activePreviewContext?.kind !== "figure" ||
+      !["figure", "table"].includes(activePreviewContext?.kind) ||
       !activePreviewState
     ) return false;
     return previewContextId(activePreviewState, activePreviewContext) ===
@@ -994,11 +2721,34 @@
     if (
       !state ||
       state.focused === false ||
-      activePreviewContext?.kind !== "figure" ||
+      !["figure", "table"].includes(activePreviewContext?.kind) ||
       preview.hidden
     ) {
       captionPreviewLock = null;
       return false;
+    }
+    // Caption typing is latency-sensitive. If the popup is already locked to
+    // this figure, source edits normally only shift the caption end. Use the
+    // stored bounds first and avoid rescanning the whole figure/table tree on
+    // every keystroke. A full parse is still performed after typing settles.
+    if (
+      captionPreviewLock &&
+      captionPreviewLock.contextId === activeContextId &&
+      captionPreviewLock.fileName === String(state.fileName || "") &&
+      Number.isInteger(Number(state.cursorIndex))
+    ) {
+      const lengthDelta = String(state.value || "").length -
+        Number(captionPreviewLock.sourceLength || 0);
+      const cursor = Number(state.cursorIndex);
+      const adjustedEnd = Math.max(
+        captionPreviewLock.start,
+        captionPreviewLock.end + lengthDelta
+      );
+      if (cursor >= captionPreviewLock.start && cursor <= adjustedEnd) {
+        captionPreviewLock.end = adjustedEnd;
+        captionPreviewLock.sourceLength = String(state.value || "").length;
+        return true;
+      }
     }
     const container = captionContainerAtIndex(state);
     const bounds = captionBounds(container?.caption);
@@ -1006,7 +2756,7 @@
       ? previewContextId(state, container.context)
       : "";
     const activeId = previewContextId(activePreviewState || state, activePreviewContext);
-    if (container?.kind === "figure" && bounds && containerId === activeId) {
+    if (container?.kind === activePreviewContext?.kind && bounds && containerId === activeId) {
       captionPreviewLock = {
         contextId: activeId,
         fileName: String(state.fileName || ""),
@@ -1059,6 +2809,352 @@
       cursor <= Math.max(range.openStart, range.closeEnd + lengthDelta)
     );
   }
+
+  function activeEnvironmentPreviewContainsState(state) {
+    // The mounted preview belongs to its source environment until the caret
+    // actually leaves that environment. This deliberately avoids reparsing: a
+    // half-typed equation/caption can temporarily be invalid LaTeX, but that is
+    // not a reason to close and reopen the popup. The old environment range is
+    // adjusted by the document-length delta so insertions/deletions made inside
+    // the environment keep the ownership interval in sync. Explicit user
+    // closes still use force=true and therefore remain authoritative.
+    if (
+      preview.hidden ||
+      !activePreviewContext ||
+      !activePreviewState ||
+      !state ||
+      String(state.fileName || "") !== String(activePreviewState.fileName || "") ||
+      !Number.isInteger(Number(state.cursorIndex))
+    ) return false;
+    const range = contextEnvironmentRange(activePreviewContext);
+    const lengthDelta = String(state.value || "").length -
+      String(activePreviewState.value || "").length;
+    const cursor = Number(state.cursorIndex);
+    return (
+      cursor >= range.openStart &&
+      cursor <= Math.max(range.openStart, range.closeEnd + lengthDelta)
+    );
+  }
+
+  function activeEquationTypingContext(state) {
+    if (
+      preview.hidden ||
+      previewElementKind(activePreviewContext) !== "equation" ||
+      !activePreviewState ||
+      !state ||
+      state.focused === false ||
+      String(state.fileName || "") !== String(activePreviewState.fileName || "") ||
+      !Number.isInteger(Number(state.cursorIndex))
+    ) return null;
+
+    const oldRange = contextEnvironmentRange(activePreviewContext);
+    const sourceDelta = String(state.value || "").length -
+      String(activePreviewState.value || "").length;
+    const adjustedCloseEnd = Math.max(oldRange.openStart, oldRange.closeEnd + sourceDelta);
+    const cursor = Number(state.cursorIndex);
+    if (cursor < oldRange.openStart || cursor > adjustedCloseEnd) return null;
+
+    // Prefer a newly parsed context when the current keystroke still forms valid
+    // LaTeX. While the editor is between tokens (for example just after typing a
+    // backslash or brace), retain a range-adjusted copy of the previous equation
+    // context. This prevents the popup lifecycle from interpreting a transient
+    // parser miss as "the cursor left the equation".
+    try {
+      const parsed = findPreviewContext(state);
+      if (previewElementKind(parsed) === "equation" && previewContextId(state, parsed) === activeContextId) {
+        return parsed;
+      }
+    } catch (_error) {
+      // The stable context below intentionally covers transient parse failures.
+    }
+
+    const next = { ...activePreviewContext };
+    const shiftField = (name) => {
+      if (Number.isFinite(Number(next[name])) && Number(next[name]) > oldRange.openStart) {
+        next[name] = Number(next[name]) + sourceDelta;
+      }
+    };
+    for (const name of ["contentEnd", "closeStart", "closeEnd", "floatCloseEnd"]) shiftField(name);
+    const contentStart = Math.max(0, Number(next.contentStart) || oldRange.openStart);
+    const contentEnd = Math.max(
+      contentStart,
+      Math.min(String(state.value || "").length, Number(next.contentEnd) || adjustedCloseEnd)
+    );
+    next.source = String(state.value || "").slice(contentStart, contentEnd);
+    next.cursorOffset = Math.max(0, Math.min(next.source.length, cursor - contentStart));
+    return next;
+  }
+
+  function refreshLiveEquationEditSession(state, context) {
+    if (!state || !context || previewElementKind(context) !== "equation") return false;
+    const range = contextEnvironmentRange(context);
+    liveEquationEditSession = {
+      fileName: String(state.fileName || ""),
+      openStart: range.openStart,
+      closeEnd: range.closeEnd,
+      sourceLength: String(state.value || "").length,
+      contextId: previewContextId(state, context)
+    };
+    return true;
+  }
+
+  function liveEquationEditSessionContainsState(state) {
+    const session = liveEquationEditSession;
+    if (
+      !session || !state || preview.hidden || previewElementKind(activePreviewContext) !== "equation" ||
+      String(state.fileName || "") !== session.fileName ||
+      !Number.isInteger(Number(state.cursorIndex))
+    ) return false;
+
+    // All edits in this session occur while the caret is inside the equation,
+    // so the opening position stays fixed and only the closing boundary moves
+    // with the document-length delta. This inexpensive range check is robust to
+    // transient parser/focus/screen notifications emitted by CollabTeX.
+    const delta = String(state.value || "").length - Number(session.sourceLength || 0);
+    const adjustedClose = Math.max(session.openStart, session.closeEnd + delta);
+    const cursor = Number(state.cursorIndex);
+    if (cursor < session.openStart || cursor > adjustedClose) {
+      liveEquationEditSession = null;
+      return false;
+    }
+    session.closeEnd = adjustedClose;
+    session.sourceLength = String(state.value || "").length;
+    return true;
+  }
+
+  function cancelPendingEnvironmentPreviewRender() {
+    // Live editing/caret movement inside an already mounted environment preview
+    // must never race a previously queued generic render transaction. A stale
+    // scheduleRender() job can otherwise finish after the in-place update and
+    // replace the popup DOM, which looks exactly like a close/reopen cycle.
+    // Invalidate both queued and already-running generic render generations,
+    // but deliberately keep the mounted popup itself untouched.
+    if (renderTimer !== null) {
+      window.clearTimeout(renderTimer);
+      renderTimer = null;
+    }
+    scheduledPreviewHint = null;
+    renderGeneration += 1;
+    hidePreviewLoading();
+  }
+
+  function advanceActiveEnvironmentRangeForSourceEdit(state) {
+    // Figure/table caption updates are intentionally lightweight and do not
+    // rebuild the complete environment context on every keystroke. Keep the
+    // stored closing boundaries in step with the edited document so the next
+    // state notification still belongs to the same mounted popup. Without this
+    // adjustment, activePreviewState would contain the new source length while
+    // activePreviewContext retained the old close position, causing the very
+    // next keypress to be misclassified as leaving/re-entering the environment.
+    if (!activePreviewContext || !activePreviewState || !state) return;
+    const delta = String(state.value || "").length -
+      String(activePreviewState.value || "").length;
+    if (!delta) return;
+    const openStart = contextEnvironmentRange(activePreviewContext).openStart;
+    const next = { ...activePreviewContext };
+    for (const name of ["contentEnd", "closeStart", "closeEnd", "floatContentEnd", "floatCloseEnd"]) {
+      if (Number.isFinite(Number(next[name])) && Number(next[name]) > openStart) {
+        next[name] = Number(next[name]) + delta;
+      }
+    }
+    activePreviewContext = next;
+  }
+
+  async function renderLiveEquationInPlace(state, context) {
+    // Keyboard input intentionally aborts older expensive SmartTeX work. A
+    // generic popup render can therefore remain on the interaction-task stack
+    // in an aborted state for a short time while its async transaction unwinds.
+    // latex-context.js checkpoints against the newest active task; without a
+    // fresh task here, the in-place equation update inherits that stale aborted
+    // task and immediately throws "SmartTeX task aborted: keyboard". Give every
+    // live equation refresh its own current-generation task so cancellation
+    // kills stale work but never the update caused by the same keypress.
+    const liveTaskToken = interactionTasks?.begin?.("popup-live-equation") || null;
+    try {
+    if (
+      !state || !context || previewElementKind(context) !== "equation" || preview.hidden ||
+      previewElementKind(activePreviewContext) !== "equation" ||
+      String(state.fileName || "") !== String(activePreviewState?.fileName || "")
+    ) return false;
+
+    const expectedContextId = activeContextId;
+    const nextContextId = previewContextId(state, context);
+    if (expectedContextId && nextContextId !== expectedContextId) return false;
+
+    const numbering = contextTools.equationPreviewNumbering?.(state.value, context) || null;
+    const hasSelection = Number(state.selectionFrom) !== Number(state.selectionTo);
+    if (!hasSelection) {
+      // The live path must update the visual caret as well as the equation text.
+      // The 2.1.42 cursor-only shortcut kept the popup stable but skipped this
+      // caret-placement calculation, so arrow-key movement stopped moving the
+      // caret marker in the preview. Reuse the same command-aware placement
+      // logic as a cold render while keeping the existing popup DOM mounted.
+      caretPlacementState = contextTools.resolveCaretPlacement(
+        context.source,
+        context.cursorOffset,
+        caretPlacementState
+      );
+    }
+    const commandSide = hasSelection ? null : (caretPlacementState?.commandSide || null);
+    const body = contextTools.previewBody(context, commandSide, numbering, !hasSelection);
+    let prepared;
+    try {
+      prepared = contextTools.prepareDocumentCommands(
+        state.value,
+        Number(context.openStart) || 0,
+        body
+      );
+    } catch (_error) {
+      // Keep the last valid popup rendering while document-level macros are in
+      // an intermediate state; the next keystroke will retry this transaction.
+      return false;
+    }
+
+    const cursorInsideOperator = Boolean(
+      !hasSelection &&
+      (
+        contextTools.cursorInsideControlSequence?.(context.source, context.cursorOffset) ||
+        contextTools.cursorAtProtectedAtomBoundary?.(context.source, context.cursorOffset)
+      )
+    );
+    const liveMacros = {
+      ...prepared.macros,
+      "\\label": { tokens: [], numArgs: 1 },
+      "\\nonumber": "",
+      "\\notag": "",
+      "\\SmartTeXCaret": `\\htmlClass{${
+        cursorInsideOperator
+          ? "smarttex-rendered-operator-caret"
+          : "smarttex-rendered-caret"
+      }}{\\vphantom{|}}`,
+      "\\SmartTeXOperatorCaret":
+        "\\htmlClass{smarttex-rendered-operator-caret}{\\vphantom{|}}"
+    };
+
+    const staging = document.createElement("div");
+    try {
+      katex.render(prepared.body, staging, {
+        displayMode: Boolean(context.display ?? true),
+        throwOnError: true,
+        strict: "ignore",
+        trust: trustedKatexCommand,
+        maxExpand: 1000,
+        maxSize: 25,
+        macros: liveMacros
+      });
+      if (!staging.firstElementChild && !String(staging.textContent || "").trim()) {
+        return false;
+      }
+    } catch (_error) {
+      // A caret marker can be temporarily illegal inside a document-specific
+      // macro. Retry the unchanged equation without the marker; this keeps the
+      // popup mounted and the equation current instead of falling back to the
+      // generic close/open renderer. The next cursor/key event retries the caret.
+      try {
+        const fallbackBody = contextTools.previewBody(context, null, numbering, false);
+        const fallbackPrepared = contextTools.prepareDocumentCommands(
+          state.value,
+          Number(context.openStart) || 0,
+          fallbackBody
+        );
+        staging.replaceChildren();
+        katex.render(fallbackPrepared.body, staging, {
+          displayMode: Boolean(context.display ?? true),
+          throwOnError: true,
+          strict: "ignore",
+          trust: trustedKatexCommand,
+          maxExpand: 1000,
+          maxSize: 25,
+          macros: {
+            ...fallbackPrepared.macros,
+            "\\label": { tokens: [], numArgs: 1 },
+            "\\nonumber": "",
+            "\\notag": ""
+          }
+        });
+      } catch (_fallbackError) {
+        // Deliberately retain the previous valid equation for incomplete TeX.
+        return false;
+      }
+    }
+
+    if (preview.hidden || activeContextId !== expectedContextId) return false;
+
+    // Preserve the exact popup screen position. The live fit may change width,
+    // height, or equation scale, but typing must never invoke the positioning
+    // policy or make the popup jump to another side of the caret.
+    const pinnedRect = preview.getBoundingClientRect();
+    const pinnedLeftStyle = preview.style.left;
+    const pinnedTopStyle = preview.style.top;
+    const pinnedLeft = pinnedRect.left;
+    const pinnedTop = pinnedRect.top;
+
+    output.replaceChildren(...staging.childNodes);
+    activePreviewContext = context;
+    activePreviewState = { ...state };
+    refreshLiveEquationEditSession(state, context);
+    updateEquationPreviewLineMode(context, output);
+    lastSuccessfulMarkup = output.innerHTML;
+    status.hidden = true;
+    status.removeAttribute("title");
+    preview.hidden = false;
+    preview.classList.add("smarttex-preview-visible");
+
+    const preparedFit = {
+      maxWidth: Number(preview.dataset.smarttexAutoFitMaxWidth) || undefined,
+      maxHeight: Number(preview.dataset.smarttexAutoFitMaxHeight) || undefined
+    };
+    applyPreviewAutoFitPolicyNow(preparedFit, {
+      allowGrow: preview.dataset.smarttexTemporarySized !== "true"
+    });
+    preview.style.left = pinnedLeftStyle || `${Math.round(pinnedLeft)}px`;
+    preview.style.top = pinnedTopStyle || `${Math.round(pinnedTop)}px`;
+    previewPositioned = true;
+    // Refitting can enlarge the popup toward the caret. Preserve the top-left
+    // position unless that new rectangle enters the cursor safety margin.
+    positionPreviewAtCursor();
+
+    // Store the newly valid source rendering immediately. Geometry can be
+    // measured later by the idle warmer; the markup itself is enough to make a
+    // subsequent opening a cache hit; background warming may add geometry later.
+    const markup = canonicalPreviewBaseMarkup(lastSuccessfulMarkup);
+    if (markup) {
+      const baseKey = previewBaseCacheKey(state, context);
+      previewCacheSet(previewBaseRenderCache, baseKey, markup, null);
+      previewCacheSet(previewRenderCache, previewExactCacheKey(state, context), markup, null);
+    }
+    return true;
+    } catch (error) {
+      if (interactionTasks?.isAbortError?.(error)) return false;
+      throw error;
+    } finally {
+      if (liveTaskToken) interactionTasks?.end?.(liveTaskToken);
+    }
+  }
+
+  function scheduleLiveEquationUpdate(state, context, { immediate = false } = {}) {
+    if (liveEquationUpdateTimer !== null) window.clearTimeout(liveEquationUpdateTimer);
+    if (!context || preview.hidden) return;
+    cancelPendingEnvironmentPreviewRender();
+    refreshLiveEquationEditSession(state, context);
+
+    // Do not route equation typing/caret movement through scheduleRender(). That
+    // generic path owns cold opening, spinner staging, context switching and
+    // hide/reopen decisions. Live editing mutates the already-open popup in
+    // place. Cursor-only moves are dispatched in a microtask so the rendered
+    // caret tracks arrow keys without the 48 ms typing debounce.
+    const run = () => {
+      liveEquationUpdateTimer = null;
+      if (preview.hidden || previewElementKind(activePreviewContext) !== "equation") return;
+      void renderLiveEquationInPlace(state, context);
+    };
+    if (immediate) {
+      queueMicrotask(run);
+      return;
+    }
+    liveEquationUpdateTimer = window.setTimeout(run, LIVE_EQUATION_UPDATE_DELAY_MS);
+  }
+
 
   function documentAnalysisForState(state) {
     const source = String(state?.value || "");
@@ -1199,6 +3295,29 @@
       : !referencePopupUsesHover();
   }
 
+  function lastFloatContextForState(state) {
+    const hint = lastFloatPreviewContextHint;
+    if (!hint || !state) return null;
+    if (String(hint.fileName || "") !== String(state.fileName || "")) return null;
+    if (String(hint.source || "") !== String(state.value || "")) return null;
+    const context = hint.context;
+    const cursor = Number(state.cursorIndex);
+    const range = contextEnvironmentRange(context);
+    return Number.isInteger(cursor) && cursor >= range.openStart && cursor <= range.closeEnd
+      ? context
+      : null;
+  }
+
+  function rememberFloatPreviewContext(state, context) {
+    if (!state || !context || !["figure", "table"].includes(context.kind)) return context;
+    lastFloatPreviewContextHint = {
+      fileName: String(state.fileName || ""),
+      source: String(state.value || ""),
+      context
+    };
+    return context;
+  }
+
   function findPreviewContext(state) {
     if (!state) return null;
     // The includegraphics filename argument owns this interaction. Its
@@ -1219,7 +3338,10 @@
     // hover position leaves that reference.
     if (captionReferenceSuppressesEnvironmentPreview(state)) return null;
 
-    return [
+    const cachedFloat = lastFloatContextForState(state);
+    if (cachedFloat) return cachedFloat;
+
+    const floatContext = [
       enabledFeatures.tables
         ? (
           contextTools.findTableContext(state.value, state.cursorIndex) ||
@@ -1234,6 +3356,7 @@
       .sort((left, right) => (
         (left.closeEnd - left.openStart) - (right.closeEnd - right.openStart)
       ))[0] || null;
+    return rememberFloatPreviewContext(state, floatContext);
   }
 
   function bridgeRequest(type, payload = {}, timeoutMs = 5000) {
@@ -1376,34 +3499,41 @@
     });
   }
 
-  function resolveFigurePopupFile(path, placeholder, attempt = 0, forceProjectResolution = false) {
-    const retryOrShowFailure = () => {
-      if (!placeholder.parentNode) return;
+  async function resolveFigurePopupFile(
+    path,
+    placeholder,
+    attempt = 0,
+    forceProjectResolution = false
+  ) {
+    try {
+      const direct = directFigureFile(path);
+      if (!forceProjectResolution && direct?.url) {
+        await replaceFigurePopupMedia(placeholder, direct.path || path, direct.url);
+        return true;
+      }
+
+      const response = await bridgeRequest("resolveProjectFile", { path });
+      if (!placeholder.parentNode) return false;
+      const file = response?.file;
+      if (!file?.url) throw new Error("Figure URL is unavailable.");
+      await replaceFigurePopupMedia(placeholder, file.path || path, file.url);
+      return true;
+    } catch (_error) {
+      if (!placeholder.parentNode) return false;
       if (attempt < 2) {
-        window.setTimeout(() => {
-          if (placeholder.parentNode) {
-            resolveFigurePopupFile(path, placeholder, attempt + 1, true);
-          }
-        }, 160 * (attempt + 1));
-        return;
+        await new Promise((resolve) => {
+          window.setTimeout(resolve, 160 * (attempt + 1));
+        });
+        if (!placeholder.parentNode) return false;
+        return resolveFigurePopupFile(path, placeholder, attempt + 1, true);
       }
       placeholder.classList.remove("smarttex-figure-popup-resolving");
       placeholder.textContent = path;
       placeholder.title = "The figure file could not be resolved from the CollabTeX project.";
-    };
-    const direct = directFigureFile(path);
-    if (!forceProjectResolution && direct?.url) {
-      replaceFigurePopupMedia(placeholder, direct.path || path, direct.url)
-        .catch(retryOrShowFailure);
-      return;
+      return false;
     }
-    bridgeRequest("resolveProjectFile", { path }).then((response) => {
-      if (!placeholder.parentNode) return;
-      const file = response?.file;
-      if (!file?.url) throw new Error("Figure URL is unavailable.");
-      return replaceFigurePopupMedia(placeholder, file.path || path, file.url);
-    }).catch(retryOrShowFailure);
   }
+
 
 
   function includeGraphicsArgumentAtCursor(state) {
@@ -1770,9 +3900,19 @@
   function scheduleGraphicAutocompletePreviewUpdate() {
     if (popupsSuppressedAfterEditorScroll) return;
     if (graphicAutocompleteUpdateFrame !== null) return;
-    graphicAutocompleteUpdateFrame = window.requestAnimationFrame(
-      updateGraphicAutocompletePreview
-    );
+    graphicAutocompleteUpdateFrame = window.requestAnimationFrame(() => {
+      try {
+        updateGraphicAutocompletePreview();
+      } catch (error) {
+        // Keyboard input may abort an older interaction task that is still
+        // unwinding. Autocomplete probing is optional background UI work, so an
+        // inherited AbortError should simply defer it to the next state/frame
+        // instead of becoming an unhandled page error that competes with live
+        // environment preview updates.
+        graphicAutocompleteUpdateFrame = null;
+        if (!interactionTasks?.isAbortError?.(error)) throw error;
+      }
+    });
   }
 
   function appendPopupCaption(
@@ -1789,10 +3929,24 @@
     caption.className = "smarttex-float-popup-caption";
     const label = document.createElement("strong");
     label.textContent = `${labelText} ${number ?? "?"}:`;
-    caption.append(
-      label,
-      " ",
-      tableRenderer.renderInlineLatex(text, {
+    // A caret-bearing caption is a transient cursor-specific rendering. Avoid
+    // caching it: otherwise every arrow-key position would consume an LRU entry
+    // and a stale cached caret could later reappear at the wrong caption offset.
+    const captionHasCaret = text.includes("\uE001") || text.includes("\uE002");
+    const captionCacheKey = captionHasCaret ? null : [
+      previewSourceSignature(currentState),
+      fastPreviewHash(text),
+      Number.isFinite(Number(sourceOffset)) ? Number(sourceOffset) : -1
+    ].join("::");
+    let renderedCaption = null;
+    const cachedCaptionMarkup = captionCacheKey
+      ? lruCacheGet(captionRenderCache, captionCacheKey)
+      : null;
+    if (cachedCaptionMarkup) {
+      renderedCaption = htmlNodeClone(cachedCaptionMarkup);
+    }
+    if (!renderedCaption) {
+      renderedCaption = tableRenderer.renderInlineLatex(text, {
         contextTools,
         document,
         katex,
@@ -1802,8 +3956,17 @@
           ? Number(sourceOffset)
           : undefined,
         renderReference: createCaptionReferenceLink
-      })
-    );
+      });
+      if (captionCacheKey && renderedCaption?.outerHTML) {
+        lruCacheSet(
+          captionRenderCache,
+          captionCacheKey,
+          renderedCaption.outerHTML,
+          CAPTION_RENDER_CACHE_LIMIT
+        );
+      }
+    }
+    caption.append(label, " ", renderedCaption);
     container.appendChild(caption);
     return caption;
   }
@@ -1823,9 +3986,10 @@
     );
   }
 
-  function updateFigureCaptionInPlace(
-    figure,
-    figureNumber,
+  function updateFloatCaptionInPlace(
+    floatElement,
+    labelText,
+    number,
     captionText,
     macros,
     captionSourceOffset
@@ -1833,24 +3997,205 @@
     const staging = document.createElement("div");
     const nextCaption = appendPopupCaption(
       staging,
-      "Fig.",
-      figureNumber,
+      labelText,
+      number,
       captionText,
       macros,
       captionSourceOffset
     );
-    const currentCaption = figure.querySelector(":scope > .smarttex-float-popup-caption");
+    const currentCaption = floatElement.querySelector(
+      ":scope > .smarttex-float-popup-caption"
+    );
     if (!nextCaption) {
       currentCaption?.remove();
       return;
     }
     if (!currentCaption) {
-      figure.appendChild(nextCaption);
+      floatElement.appendChild(nextCaption);
       return;
     }
     const scrollTop = currentCaption.scrollTop;
     currentCaption.replaceChildren(...nextCaption.childNodes);
     currentCaption.scrollTop = scrollTop;
+  }
+
+  function liveCaptionTextFromLock(state) {
+    if (!state || !captionPreviewLock) return null;
+    const source = String(state.value || "");
+    const start = Math.max(0, Math.min(source.length, Number(captionPreviewLock.start) || 0));
+    const end = Math.max(
+      start,
+      Math.min(source.length, Number(captionPreviewLock.end) || start)
+    );
+    let captionText = source.slice(start, end);
+    if (typeof contextTools.removeLatexCommentsPreservingLength === "function") {
+      captionText = contextTools.removeLatexCommentsPreservingLength(captionText);
+    }
+
+    // Mirror the editor caret inside the rendered figure/table caption. The
+    // private markers are understood by table-renderer.js in ordinary text and
+    // converted to the same SmartTeXCaret KaTeX macros when they occur in math.
+    // This updates only the caption DOM; the surrounding float stays mounted.
+    const cursor = Number(state.cursorIndex);
+    const selectionFrom = Number(state.selectionFrom ?? cursor);
+    const selectionTo = Number(state.selectionTo ?? cursor);
+    if (
+      Number.isInteger(cursor) &&
+      selectionFrom === selectionTo &&
+      cursor >= start &&
+      cursor <= end
+    ) {
+      const literalOffset = Math.max(0, Math.min(captionText.length, cursor - start));
+      caretPlacementState = contextTools.resolveCaretPlacement(
+        captionText,
+        literalOffset,
+        caretPlacementState
+      );
+      const caretOffset = contextTools.commandAwareCaretOffset(
+        captionText,
+        literalOffset,
+        caretPlacementState?.commandSide || null
+      );
+      const operatorCaret = Boolean(
+        contextTools.cursorInsideControlSequence?.(captionText, literalOffset) ||
+        contextTools.cursorAtProtectedAtomBoundary?.(captionText, literalOffset)
+      );
+      const marker = operatorCaret ? "\uE002" : "\uE001";
+      captionText = captionText.slice(0, caretOffset) + marker + captionText.slice(caretOffset);
+    }
+    return captionText.trim();
+  }
+
+  function ensureLiveCaptionRenderInfo(state, floatElement) {
+    if (
+      activeFloatCaptionRenderInfo?.contextId === activeContextId &&
+      activeFloatCaptionRenderInfo?.macros
+    ) return activeFloatCaptionRenderInfo;
+    if (!state || !activePreviewContext || !["figure", "table"].includes(activePreviewContext.kind)) {
+      return null;
+    }
+    const captionText = liveCaptionTextFromLock(state) || "";
+    let prepared;
+    try {
+      prepared = contextTools.prepareDocumentCommands(
+        state.value,
+        activePreviewContext.openStart,
+        captionText
+      );
+    } catch (_error) {
+      prepared = { macros: { "\\ensuremath": "#1" } };
+    }
+    const existingLabel = String(
+      floatElement?.querySelector?.(":scope > .smarttex-float-popup-caption > strong")?.textContent || ""
+    ).trim();
+    const labelMatch = existingLabel.match(/^(.*?)[\s]+([^:]+):$/);
+    const isTable = activePreviewContext.kind === "table";
+    activeFloatCaptionRenderInfo = {
+      contextId: activeContextId,
+      labelText: labelMatch?.[1] || (isTable ? "Table" : "Fig."),
+      number: labelMatch?.[2] || "?",
+      macros: {
+        ...(prepared?.macros || {}),
+        "\\label": { tokens: [], numArgs: 1 },
+        "\\nonumber": "",
+        "\\notag": "",
+        "\\SmartTeXCaret": "\\htmlClass{smarttex-rendered-caret}{\\vphantom{|}}",
+        "\\SmartTeXOperatorCaret": "\\htmlClass{smarttex-rendered-operator-caret}{\\vphantom{|}}"
+      },
+      sourceOffset: Number(captionPreviewLock?.start) || null
+    };
+    return activeFloatCaptionRenderInfo;
+  }
+
+  function applyLiveCaptionUpdate(state) {
+    liveCaptionUpdateTimer = null;
+    cancelPendingEnvironmentPreviewRender();
+    // Caption rendering uses the same LaTeX-context helpers as equations. Run
+    // it under a fresh interaction task as well; otherwise a keyboard-aborted
+    // generic render still on the stack can abort the caption update and force
+    // a later cold reopen.
+    const liveTaskToken = interactionTasks?.begin?.("popup-live-caption") || null;
+    try {
+    if (
+      !captionPreviewLock ||
+      preview.hidden ||
+      captionPreviewLock.contextId !== activeContextId ||
+      !["figure", "table"].includes(activePreviewContext?.kind)
+    ) return false;
+    const floatElement = output.querySelector(
+      activePreviewContext.kind === "figure"
+        ? ":scope > .smarttex-figure-popup"
+        : ":scope > .smarttex-table-popup"
+    );
+    if (!floatElement) return false;
+    const info = ensureLiveCaptionRenderInfo(state, floatElement);
+    if (!info || info.contextId !== activeContextId) return false;
+    const captionText = liveCaptionTextFromLock(state);
+    if (captionText === null) return false;
+
+    // Preserve the mounted popup's exact top-left coordinates while the caption
+    // DOM and fit are updated. The fit solver is allowed to change width/height,
+    // but it must not turn an ordinary caption keypress into a new placement.
+    // After restoring these coordinates we run only the cursor safety-margin
+    // check, which may relocate the popup if the newly enlarged box would
+    // actually collide with the caret.
+    const pinnedRect = preview.getBoundingClientRect();
+    const pinnedLeftStyle = preview.style.left;
+    const pinnedTopStyle = preview.style.top;
+    const pinnedLeft = pinnedRect.left;
+    const pinnedTop = pinnedRect.top;
+
+    updateFloatCaptionInPlace(
+      floatElement,
+      info.labelText,
+      info.number,
+      captionText,
+      info.macros,
+      Number(captionPreviewLock.start)
+    );
+    advanceActiveEnvironmentRangeForSourceEdit(state);
+
+    // Keep the already-visible popup and its position. Only rerun the common
+    // live fit solver so a longer caption can grow the current window and a
+    // shorter/changed caption can shed an unnecessary scrollbar/auto-fit scale.
+    activePreviewState = {
+      ...activePreviewState,
+      value: state.value,
+      cursorIndex: state.cursorIndex,
+      selectionFrom: state.selectionFrom,
+      selectionTo: state.selectionTo,
+      screen: state.screen || activePreviewState?.screen
+    };
+    const prepared = {
+      maxWidth: Number(preview.dataset.smarttexAutoFitMaxWidth) || undefined,
+      maxHeight: Number(preview.dataset.smarttexAutoFitMaxHeight) || undefined
+    };
+    applyPreviewAutoFitPolicyNow(prepared, {
+      allowGrow: preview.dataset.smarttexTemporarySized !== "true"
+    });
+    preview.style.left = pinnedLeftStyle || `${Math.round(pinnedLeft)}px`;
+    preview.style.top = pinnedTopStyle || `${Math.round(pinnedTop)}px`;
+    previewPositioned = true;
+    positionPreviewAtCursor();
+    return true;
+    } catch (error) {
+      if (interactionTasks?.isAbortError?.(error)) return false;
+      throw error;
+    } finally {
+      if (liveTaskToken) interactionTasks?.end?.(liveTaskToken);
+    }
+  }
+
+  function scheduleLiveCaptionUpdate(state, { immediate = false } = {}) {
+    if (liveCaptionUpdateTimer !== null) {
+      window.clearTimeout(liveCaptionUpdateTimer);
+      liveCaptionUpdateTimer = null;
+    }
+    if (!captionPreviewIsLocked() || preview.hidden) return;
+    liveCaptionUpdateTimer = window.setTimeout(
+      () => applyLiveCaptionUpdate(state),
+      immediate ? 0 : LIVE_CAPTION_UPDATE_DELAY_MS
+    );
   }
 
   function boundedPopupText(value, maximum) {
@@ -3579,6 +5924,7 @@
     media.style.width = `${desiredWidth}px`;
 
     let imageCount = 0;
+    const mediaReadyPromises = [];
     for (const rowModel of layoutModel.rows || []) {
       const row = document.createElement("div");
       row.className = "smarttex-figure-layout-row";
@@ -3622,7 +5968,7 @@
           const placeholder = figurePopupPlaceholder(imageModel.path, true);
           configureFigurePopupImage(placeholder, imageModel);
           panel.appendChild(placeholder);
-          resolveFigurePopupFile(imageModel.path, placeholder);
+          mediaReadyPromises.push(resolveFigurePopupFile(imageModel.path, placeholder));
         }
         row.appendChild(panel);
       }
@@ -3651,6 +5997,10 @@
       captionSourceOffset
     );
     renderer?.observePopupLayout?.(media);
+    // The opening pipeline waits for cold image/PDF resolution before it ever
+    // measures or reveals this figure. Failed files resolve to their stable
+    // placeholder, so one missing asset cannot block the whole popup.
+    figure.__smarttexReadyPromise = Promise.allSettled(mediaReadyPromises);
     return figure;
   }
 
@@ -3761,6 +6111,28 @@
       .slice(0, 500);
   }
 
+  function previewPinnedDuringEditorTyping() {
+    if (
+      preview.hidden ||
+      !previewPositioned ||
+      !activePreviewContext ||
+      !activePreviewState ||
+      !currentState ||
+      currentState.focused === false ||
+      Date.now() - lastEditorTextInputAt >= 650 ||
+      String(currentState.fileName || "") !== String(activePreviewState.fileName || "")
+    ) return false;
+    const range = contextEnvironmentRange(activePreviewContext);
+    const sourceLengthDelta = String(currentState.value || "").length -
+      String(activePreviewState.value || "").length;
+    const cursor = Number(currentState.cursorIndex);
+    const adjustedCloseEnd = Math.max(
+      range.openStart,
+      range.closeEnd + sourceLengthDelta
+    );
+    return Number.isInteger(cursor) && cursor >= range.openStart && cursor <= adjustedCloseEnd;
+  }
+
   function positionPreviewAtCursor({ force = false, preferPointer = false } = {}) {
     const anchor = (preferPointer && lastPointerScreen) || activePreviewState?.screen || currentState?.screen;
     if (preview.hidden || !anchor) return;
@@ -3783,6 +6155,13 @@
     const rect = preview.getBoundingClientRect();
     const width = Math.min(rect.width || 360, window.innerWidth - margin * 2);
     const height = Math.min(rect.height || 100, window.innerHeight - margin * 2);
+
+    // Typing and cursor movement do not pin the popup unconditionally. They use
+    // the same safety-margin rule as every other editor update: keep the exact
+    // coordinates while the caret is safely away, but relocate when the caret
+    // would otherwise run into the popup. This avoids per-key wandering without
+    // allowing the popup to cover the text being edited.
+
     const cursorClearance = Math.max(12, Math.round(lineHeight * 1.25));
     const popupTooCloseToCursor = (
       rect.left < cursorRect.right + cursorClearance &&
@@ -3790,25 +6169,15 @@
       rect.top < cursorRect.bottom + cursorClearance &&
       rect.bottom > cursorRect.top - cursorClearance
     );
-    const popupLeavesViewport = (
-      rect.left < margin ||
-      rect.right > window.innerWidth - margin ||
-      rect.top < margin ||
-      rect.bottom > window.innerHeight - margin
-    );
-
-    if (!force && verticalScrollRepositionPending && previewPositioned) {
-      const followsAbove = preview.dataset.placement === "above";
-      const top = followsAbove
-        ? cursorTop - gap - height
-        : cursorTop + lineHeight + gap;
-      preview.style.top = `${Math.round(top)}px`;
+    if (!force && previewPositioned && !popupTooCloseToCursor) {
+      // Once visible, cursor proximity is the *only* automatic relocation
+      // trigger. Arrow-key movement, typing, cache refreshes, image decoding,
+      // editor scrolling and layout/viewport changes must leave the popup at
+      // exactly the same coordinates while the caret remains safely away. The
+      // popup is already size-limited to the usable viewport by the fit policy,
+      // so silently re-anchoring it for unrelated viewport changes is both
+      // unnecessary and visually disruptive.
       verticalScrollRepositionPending = false;
-      preview.classList.remove("smarttex-preview-measuring");
-      return;
-    }
-
-    if (!force && previewPositioned && !popupTooCloseToCursor && !popupLeavesViewport) {
       preview.classList.remove("smarttex-preview-measuring");
       return;
     }
@@ -3942,6 +6311,24 @@
 
   function positionPreview() {
     if (preview.hidden) return;
+
+    // Environment-boundary positioning is an opening-time decision only. Once
+    // visible, keep the popup exactly where it is and let the cursor-proximity
+    // guard move it only when the cursor approaches/overlaps the popup. This
+    // prevents image-load, cache,
+    // and background-refresh callbacks from making a stationary popup wander.
+    if (
+      previewPositioned &&
+      preview.dataset.smarttexStaging !== "true" &&
+      preview.classList.contains("smarttex-preview-visible")
+    ) {
+      previewPositionGeneration += 1;
+      positionPreviewAtCursor({
+        preferPointer: activePreviewState?.smarttexHoverPreview === true
+      });
+      return;
+    }
+
     const context = activePreviewContext;
     if (!environmentPopupContext(context)) {
       previewPositionGeneration += 1;
@@ -3969,6 +6356,308 @@
     });
   }
 
+  function nextPreviewFrame() {
+    return new Promise((resolve) => {
+      if (typeof window.requestAnimationFrame === "function") {
+        window.requestAnimationFrame(() => resolve());
+      } else {
+        window.setTimeout(resolve, 0);
+      }
+    });
+  }
+
+  async function positionPreviewForReveal() {
+    if (preview.hidden) return false;
+    const context = activePreviewContext;
+    if (!environmentPopupContext(context)) {
+      previewPositionGeneration += 1;
+      positionPreviewAtCursor({
+        force: true,
+        preferPointer: activePreviewState?.smarttexHoverPreview === true
+      });
+      return true;
+    }
+
+    const generation = ++previewPositionGeneration;
+    const contextId = activeContextId;
+    const [openingScreen, closingScreen] = await Promise.all([
+      editorCoordinateAt(environmentBoundaryIndex(context, false)),
+      editorCoordinateAt(environmentBoundaryIndex(context, true))
+    ]);
+    if (
+      generation !== previewPositionGeneration ||
+      preview.hidden ||
+      contextId !== activeContextId
+    ) return false;
+    if (!positionPreviewAtEnvironment(openingScreen, closingScreen)) {
+      positionPreviewAtCursor({ force: true, preferPointer: true });
+    }
+    return true;
+  }
+
+  function previewOverflowMetrics() {
+    const popupRect = preview.getBoundingClientRect();
+    const outputRect = output.getBoundingClientRect();
+
+    // The output element can be taller/wider than the fixed outer popup while
+    // the outer popup clips it with overflow:hidden. Looking only at
+    // output.clientHeight/scrollHeight therefore misses precisely the case in
+    // which a figure caption falls below the popup bottom. Measure the actual
+    // space remaining inside the outer popup as well.
+    const availableWidth = Math.max(
+      1,
+      Math.min(
+        output.clientWidth || outputRect.width || 1,
+        popupRect.right - outputRect.left - 1
+      )
+    );
+    const availableHeight = Math.max(
+      1,
+      Math.min(
+        output.clientHeight || outputRect.height || 1,
+        popupRect.bottom - outputRect.top - 1
+      )
+    );
+    const figurePopup = preview.dataset.previewKind === "figure"
+      ? output.querySelector(":scope > .smarttex-figure-popup")
+      : null;
+    const figureViewport = figurePopup?.querySelector(":scope > .smarttex-figure-popup-viewport") || null;
+    const figureMedia = figureViewport?.querySelector(".smarttex-figure-popup-media") || null;
+    const viewportRect = figureViewport?.getBoundingClientRect?.() || null;
+    const mediaRect = figureMedia?.getBoundingClientRect?.() || null;
+    const mediaOverflowWidth = figureViewport && figureMedia
+      ? Math.max(0, Math.max(figureMedia.scrollWidth || 0, mediaRect?.width || 0) -
+        Math.max(1, figureViewport.clientWidth || viewportRect?.width || 1))
+      : 0;
+    const mediaOverflowHeight = figureViewport && figureMedia
+      ? Math.max(0, Math.max(figureMedia.scrollHeight || 0, mediaRect?.height || 0) -
+        Math.max(1, figureViewport.clientHeight || viewportRect?.height || 1))
+      : 0;
+
+    // A fixed figure viewport intentionally clips oversized media so that the
+    // caption can keep its own row. Include that hidden media excess in the
+    // fit calculation; otherwise the outer output looks non-overflowing and
+    // the policy would enable a scrollbar instead of shrinking the image.
+    const contentWidth = Math.max(
+      output.scrollWidth || 0,
+      outputRect.width || 0,
+      availableWidth + mediaOverflowWidth,
+      availableWidth
+    );
+    const outputStyle = globalThis.getComputedStyle?.(output);
+    const outputVerticalPadding = (parseFloat(outputStyle?.paddingTop) || 0) +
+      (parseFloat(outputStyle?.paddingBottom) || 0);
+    const figureRequiredHeight = figurePopup
+      ? Math.max(
+          Number(figurePopup.dataset.smarttexRequiredHeightPx) || 0,
+          figurePopup.scrollHeight || 0,
+          figurePopup.getBoundingClientRect?.().height || 0
+        ) + outputVerticalPadding
+      : 0;
+    const contentHeight = Math.max(
+      output.scrollHeight || 0,
+      outputRect.height || 0,
+      availableHeight + mediaOverflowHeight,
+      figureRequiredHeight,
+      availableHeight
+    );
+    return {
+      clientWidth: availableWidth,
+      clientHeight: availableHeight,
+      scrollWidth: contentWidth,
+      scrollHeight: contentHeight,
+      widthRatio: availableWidth / contentWidth,
+      heightRatio: availableHeight / contentHeight,
+      overflowX: contentWidth > availableWidth + 1,
+      overflowY: contentHeight > availableHeight + 1,
+      mediaOverflowWidth,
+      mediaOverflowHeight
+    };
+  }
+
+  function setPreviewAutoFitZoomAndMeasure(value) {
+    previewAutoFitZoom = Math.max(0.75, Math.min(1, Number(value) || 1));
+    refreshPreviewZoom();
+    globalThis.SmartTeXFigureRenderer?.fitPopupLayout?.(
+      output.querySelector(".smarttex-figure-layout")
+    );
+    return previewOverflowMetrics();
+  }
+
+  function finishPreviewAutoFitNow() {
+    let metrics = previewOverflowMetrics();
+    if (!metrics.overflowX && !metrics.overflowY) {
+      preview.classList.remove("smarttex-preview-scroll-fallback");
+      return metrics;
+    }
+
+    // Do not decide that scrollbars are necessary from a single proportional
+    // estimate. Cached DOM in particular can have slightly different live font
+    // or image metrics than the geometry stored with the cache entry. Probe the
+    // actual 75% floor first; if it fits, binary-search back upward to the
+    // largest no-scroll zoom. This exact live-DOM solver is shared by cold and
+    // warm paths so cached previews cannot acquire scrollbars that a fresh
+    // render would avoid by shrinking a little more.
+    const floorMetrics = setPreviewAutoFitZoomAndMeasure(0.75);
+    if (floorMetrics.overflowX || floorMetrics.overflowY) {
+      preview.classList.add("smarttex-preview-scroll-fallback");
+      return floorMetrics;
+    }
+
+    let lowerFit = 0.75;
+    let upperOverflow = 1;
+    let bestMetrics = floorMetrics;
+    for (let iteration = 0; iteration < 7; iteration += 1) {
+      const candidate = (lowerFit + upperOverflow) / 2;
+      const candidateMetrics = setPreviewAutoFitZoomAndMeasure(candidate);
+      if (candidateMetrics.overflowX || candidateMetrics.overflowY) {
+        upperOverflow = candidate;
+      } else {
+        lowerFit = candidate;
+        bestMetrics = candidateMetrics;
+      }
+    }
+    // Stay a few thousandths below the binary boundary to absorb integer-pixel
+    // scrollbar/rounding differences. If that boundary is still unstable,
+    // fall back to the already-proven 75% fit rather than enabling scrollbars.
+    bestMetrics = setPreviewAutoFitZoomAndMeasure(Math.max(0.75, lowerFit - 0.003));
+    if (bestMetrics.overflowX || bestMetrics.overflowY) {
+      bestMetrics = setPreviewAutoFitZoomAndMeasure(0.75);
+    }
+    preview.classList.remove("smarttex-preview-scroll-fallback");
+    return bestMetrics;
+  }
+
+  function applyPreviewAutoFitPolicyNow(prepared, { allowGrow = true } = {}) {
+    previewAutoFitZoom = 1;
+    preview.classList.remove("smarttex-preview-scroll-fallback");
+    refreshPreviewZoom();
+    globalThis.SmartTeXFigureRenderer?.fitPopupLayout?.(
+      output.querySelector(".smarttex-figure-layout")
+    );
+
+    let metrics = previewOverflowMetrics();
+    if (allowGrow && (metrics.overflowX || metrics.overflowY)) {
+      const popupRect = preview.getBoundingClientRect();
+      previewPopupUI?.growForContent?.({
+        width: popupRect.width + Math.max(0, metrics.scrollWidth - metrics.clientWidth),
+        height: popupRect.height + Math.max(0, metrics.scrollHeight - metrics.clientHeight),
+        maxWidth: prepared?.maxWidth,
+        maxHeight: prepared?.maxHeight
+      });
+      previewAutoFitZoom = 1;
+      refreshPreviewZoom();
+      globalThis.SmartTeXFigureRenderer?.fitPopupLayout?.(
+        output.querySelector(".smarttex-figure-layout")
+      );
+      metrics = previewOverflowMetrics();
+    }
+
+    if (metrics.overflowX || metrics.overflowY) {
+      return finishPreviewAutoFitNow();
+    }
+    preview.classList.remove("smarttex-preview-scroll-fallback");
+    return metrics;
+  }
+
+  async function applyPreviewAutoFitPolicy(prepared, { allowGrow = true } = {}) {
+    previewAutoFitZoom = 1;
+    preview.classList.remove("smarttex-preview-scroll-fallback");
+    refreshPreviewZoom();
+    globalThis.SmartTeXFigureRenderer?.fitPopupLayout?.(
+      output.querySelector(".smarttex-figure-layout")
+    );
+    await nextPreviewFrame();
+
+    let metrics = previewOverflowMetrics();
+    if (allowGrow && (metrics.overflowX || metrics.overflowY)) {
+      const popupRect = preview.getBoundingClientRect();
+      previewPopupUI?.growForContent?.({
+        width: popupRect.width + Math.max(0, metrics.scrollWidth - metrics.clientWidth),
+        height: popupRect.height + Math.max(0, metrics.scrollHeight - metrics.clientHeight),
+        maxWidth: prepared?.maxWidth,
+        maxHeight: prepared?.maxHeight
+      });
+      await nextPreviewFrame();
+      previewAutoFitZoom = 1;
+      refreshPreviewZoom();
+      globalThis.SmartTeXFigureRenderer?.fitPopupLayout?.(
+        output.querySelector(".smarttex-figure-layout")
+      );
+      await nextPreviewFrame();
+      metrics = previewOverflowMetrics();
+    }
+
+    // Once geometry is stable, finish with the same synchronous live-DOM
+    // convergence used by the warm-cache fast path. Avoiding another sequence
+    // of animation frames keeps cold opening responsive while preserving exact
+    // grow -> >=75% shrink -> scrollbar semantics.
+    if (metrics.overflowX || metrics.overflowY) {
+      return finishPreviewAutoFitNow();
+    }
+    preview.classList.remove("smarttex-preview-scroll-fallback");
+    return metrics;
+  }
+
+  async function revealStagedPreview(generation, contextId, { rebase = true } = {}) {
+    if (generation !== renderGeneration || contextId !== activeContextId) return false;
+
+    preview.dataset.smarttexStaging = "true";
+    preview.classList.add("smarttex-preview-staging", "smarttex-preview-intrinsic-measure");
+    preview.classList.remove("smarttex-preview-visible", "smarttex-preview-scroll-fallback");
+    preview.hidden = false;
+    previewLoadingIndicator.hidden = true;
+    previewAutoFitZoom = 1;
+    refreshPreviewZoom();
+
+    if (rebase) previewPopupUI?.resetForMeasurement?.();
+
+    await nextPreviewFrame();
+    if (generation !== renderGeneration || contextId !== activeContextId) return false;
+
+    // Measure completely unconstrained rendered content first. Only after that
+    // do we apply the persistent slider scale and the viewport-dependent cap.
+    const prepared = previewPopupUI?.prepareForReveal?.({ rebase: false });
+    preview.classList.remove("smarttex-preview-intrinsic-measure");
+    if (!prepared) return false;
+
+    await nextPreviewFrame();
+    if (generation !== renderGeneration || contextId !== activeContextId) return false;
+
+    await applyPreviewAutoFitPolicy(prepared);
+    if (generation !== renderGeneration || contextId !== activeContextId) return false;
+
+    previewPositioned = false;
+    await positionPreviewForReveal();
+    if (generation !== renderGeneration || contextId !== activeContextId) return false;
+
+    delete preview.dataset.smarttexStaging;
+    preview.classList.remove(
+      "smarttex-preview-staging",
+      "smarttex-preview-measuring",
+      "smarttex-preview-intrinsic-measure"
+    );
+    preview.classList.add("smarttex-preview-visible");
+    return { prepared, metrics: previewCacheMetricsFromReveal(prepared) };
+  }
+
+  async function renderWithTransientRetries(operation, attempts = 3) {
+    let lastError = null;
+    for (let attempt = 0; attempt < Math.max(1, attempts); attempt += 1) {
+      try {
+        return operation();
+      } catch (error) {
+        if (interactionTasks?.isAbortError?.(error)) throw error;
+        lastError = error;
+        if (attempt + 1 >= attempts) break;
+        // A newly opened table/equation can race one browser layout/font turn.
+        // Retry internally instead of requiring another user hover/click.
+        await new Promise((resolve) => window.setTimeout(resolve, 45 * (attempt + 1)));
+      }
+    }
+    throw lastError || new Error("Preview rendering failed.");
+  }
+
   function showRenderError(contextId, context, error) {
     if (contextId !== activeContextId) return;
     preview.classList.toggle("smarttex-preview-stale", Boolean(lastSuccessfulMarkup));
@@ -3987,6 +6676,8 @@
       fallback.textContent = context.source.trim() || " ";
       output.appendChild(fallback);
     }
+    delete preview.dataset.smarttexStaging;
+    preview.classList.remove("smarttex-preview-staging", "smarttex-preview-measuring");
     preview.hidden = false;
     preview.classList.add("smarttex-preview-visible");
     window.requestAnimationFrame(() => {
@@ -3995,11 +6686,651 @@
     });
   }
 
+  async function waitForCachedPreviewMedia(root) {
+    const images = [...root.querySelectorAll("img")];
+    await Promise.all(images.map(async (image) => {
+      if (image.complete && image.naturalWidth) return;
+      try { await image.decode?.(); } catch (_error) {
+        if (!image.complete) {
+          await new Promise((resolve) => {
+            image.addEventListener("load", resolve, { once: true });
+            image.addEventListener("error", resolve, { once: true });
+          });
+        }
+      }
+    }));
+  }
+
+  async function measureBackgroundPreviewMarkup(markup, kind, equationSingleLine = false) {
+    if (!markup) return null;
+    await katexFontsReady;
+    const shell = preview.cloneNode(true);
+    shell.hidden = false;
+    shell.removeAttribute("style");
+    shell.classList.remove("smarttex-preview-visible", "smarttex-preview-scroll-fallback");
+    shell.classList.add("smarttex-preview-staging", "smarttex-preview-intrinsic-measure");
+    shell.dataset.previewKind = kind;
+    shell.dataset.smarttexPopupType = kind === "figure" ? "image" : kind;
+    if (kind === "equation") {
+      shell.dataset.smarttexEquationSingleLine = equationSingleLine ? "true" : "false";
+    } else {
+      delete shell.dataset.smarttexEquationSingleLine;
+    }
+    shell.style.setProperty("left", "-10000px", "important");
+    shell.style.setProperty("top", "-10000px", "important");
+    const shellOutput = shell.querySelector(".smarttex-equation-output");
+    if (!shellOutput) return null;
+    shellOutput.innerHTML = markup;
+    const shellStatus = shell.querySelector(".smarttex-preview-status");
+    if (shellStatus) shellStatus.hidden = true;
+    document.documentElement.appendChild(shell);
+    try {
+      // Background figure warming has already decoded the source media and
+      // stabilizeCachedPreviewMedia() serializes intrinsic width/height into the
+      // cached markup. Those dimensions are sufficient for layout measurement;
+      // waiting for cloned <img> elements to decode again only delays the cache
+      // without improving geometry. Fall back to decode only for legacy/partial
+      // cache markup that lacks stable intrinsic dimensions.
+      if (!cachedPreviewMediaGeometryReady(shellOutput)) {
+        await waitForCachedPreviewMedia(shellOutput);
+      }
+      await nextPreviewFrame();
+      const rect = shell.getBoundingClientRect();
+      const contentRect = shellOutput.getBoundingClientRect();
+      if (!(rect.width > 1) || !(rect.height > 1)) return null;
+      return {
+        naturalSize: { width: rect.width, height: rect.height },
+        contentNaturalSize: {
+          width: Math.max(contentRect.width || 0, shellOutput.scrollWidth || 0),
+          height: Math.max(contentRect.height || 0, shellOutput.scrollHeight || 0)
+        },
+        equationSingleLine: Boolean(equationSingleLine),
+        kind,
+        mediaReady: true
+      };
+    } finally {
+      shell.remove();
+    }
+  }
+
+  function previewCacheMetricsFromReveal(prepared) {
+    if (!prepared?.naturalSize) return null;
+    const rect = preview.getBoundingClientRect();
+    return {
+      naturalSize: { ...prepared.naturalSize },
+      contentNaturalSize: {
+        width: Math.max(output.clientWidth || 0, output.scrollWidth || 0),
+        height: Math.max(output.clientHeight || 0, output.scrollHeight || 0)
+      },
+      equationSingleLine: preview.dataset.smarttexEquationSingleLine === "true",
+      kind: preview.dataset.previewKind || "equation",
+      mediaReady: true,
+      relativeScale: Number(prepared.relativeScale) || 1,
+      viewportWidth: window.innerWidth,
+      viewportHeight: window.innerHeight,
+      maxWidth: Number(prepared.maxWidth) || 0,
+      maxHeight: Number(prepared.maxHeight) || 0,
+      finalSize: { width: rect.width, height: rect.height },
+      autoFitZoom: previewAutoFitZoom,
+      scrollFallback: preview.classList.contains("smarttex-preview-scroll-fallback")
+    };
+  }
+
+  function applyCachedEquationLineMode(context, metrics) {
+    if (context?.kind === "table" || context?.kind === "figure") {
+      delete preview.dataset.smarttexEquationSingleLine;
+      return;
+    }
+    if (typeof metrics?.equationSingleLine === "boolean") {
+      preview.dataset.smarttexEquationSingleLine = metrics.equationSingleLine ? "true" : "false";
+    } else {
+      updateEquationPreviewLineMode(context, output);
+    }
+  }
+
+  function cachedPreviewMediaReady(root) {
+    return [...root.querySelectorAll("img")].every((image) => (
+      image.complete && Number(image.naturalWidth) > 0
+    ));
+  }
+
+  async function revealCachedPreviewMarkup(cachedValue, generation, contextId, { fast = false } = {}) {
+    const cached = normalizedPreviewCacheEntry(cachedValue);
+    if (!cached?.markup || generation !== renderGeneration || contextId !== activeContextId) return false;
+    const openingFromCache = preview.hidden || preview.dataset.smarttexStaging === "true" || !previewPositioned;
+    // Cache refreshes can happen while the popup is already visible (for
+    // example after an arrow key or a background cache promotion). Preserve the
+    // existing top-left position in that case. Only a genuinely new opening is
+    // allowed to run the initial placement policy.
+    const stablePosition = !openingFromCache ? preview.getBoundingClientRect() : null;
+    if (openingFromCache) setPopupOpenedFromCache(true);
+    output.innerHTML = cached.markup;
+    applyCachedEquationLineMode(activePreviewContext, cached.metrics);
+
+    // A fast cache hit is valid only when any media in the cloned markup is
+    // already decoded. Otherwise use the normal staged path, which waits for
+    // stable image geometry before measuring.
+    if (fast && cached.metrics?.naturalSize && cachedPreviewMediaGeometryReady(output)) {
+      lastSuccessfulMarkup = cached.markup;
+      status.hidden = true;
+      status.removeAttribute("title");
+      preview.classList.remove("smarttex-preview-stale", "smarttex-preview-visible", "smarttex-preview-scroll-fallback");
+      preview.classList.add("smarttex-preview-staging");
+      preview.dataset.smarttexStaging = "true";
+      preview.hidden = false;
+      previewLoadingIndicator.hidden = true;
+      const prepared = previewPopupUI?.prepareCachedForReveal?.(cached.metrics);
+      if (prepared) {
+        // Cached markup and intrinsic geometry are reusable, but the *fitted*
+        // dimensions are not authoritative. Revalidate against the live DOM and
+        // current font metrics so a warm equation fits identically to a freshly
+        // parsed one. This is synchronous: layout reads force only the minimal
+        // browser layout work and still avoid parsing/KaTeX/image decoding.
+        applyPreviewAutoFitPolicyNow(prepared);
+        if (generation !== renderGeneration || contextId !== activeContextId) return false;
+        const liveMetrics = previewCacheMetricsFromReveal(prepared);
+        if (liveMetrics) cached.metrics = liveMetrics;
+        if (stablePosition) {
+          preview.style.left = `${Math.round(stablePosition.left)}px`;
+          preview.style.top = `${Math.round(stablePosition.top)}px`;
+          previewPositioned = true;
+          // A changed popup size can bring its edge closer to the caret. Apply
+          // the normal safety-margin check, but do not otherwise move it.
+          positionPreviewAtCursor({
+            preferPointer: activePreviewState?.smarttexHoverPreview === true
+          });
+        } else {
+          previewPositioned = false;
+          positionPreviewAtCursor({
+            force: true,
+            preferPointer: activePreviewState?.smarttexHoverPreview === true
+          });
+        }
+        delete preview.dataset.smarttexStaging;
+        preview.classList.remove("smarttex-preview-staging", "smarttex-preview-measuring");
+        preview.classList.add("smarttex-preview-visible");
+        if (previewLoadingGlobalGeneration !== null) {
+          hideEnvironmentPopupLoadingSpinner(previewLoadingGlobalGeneration);
+          previewLoadingGlobalGeneration = null;
+        }
+        return true;
+      }
+    }
+
+    await waitForCachedPreviewMedia(output);
+    if (generation !== renderGeneration || contextId !== activeContextId) return false;
+    lastSuccessfulMarkup = cached.markup;
+    globalThis.SmartTeXFigureRenderer?.observePopupLayout?.(
+      output.querySelector(".smarttex-figure-layout")
+    );
+    status.hidden = true;
+    status.removeAttribute("title");
+    preview.classList.remove("smarttex-preview-stale");
+    const revealed = await revealStagedPreview(generation, contextId, { rebase: true });
+    if (revealed?.metrics) {
+      // A markup-only cache entry can arise from an in-place cursor/caption
+      // refresh. Promote it to a measured warm entry after this one staged
+      // measurement so subsequent openings do not repeat the measurement path.
+      cached.metrics = revealed.metrics;
+    }
+    if (revealed && previewLoadingGlobalGeneration !== null) {
+      hideEnvironmentPopupLoadingSpinner(previewLoadingGlobalGeneration);
+      previewLoadingGlobalGeneration = null;
+    }
+    return revealed;
+  }
+
+  async function buildBackgroundPopupCache(entry, sourceSignature) {
+    if (sourceSignature !== previewSourceSignature(currentState)) return;
+    const target = numberedOutlinePreviewContext(entry);
+    if (!target) return;
+    const source = String(currentState?.value || "");
+    const context = target.context || target;
+    if (!context?.source) return;
+    const kind = String(entry?.type || context.kind || context.type || "equation");
+    const baseKey = previewBaseCacheKey(currentState, { ...context, kind });
+    const existingWarmEntry = normalizedPreviewCacheEntry(previewBaseRenderCache.get(baseKey));
+    // A source diagnostic should mean "ready for the fast opening path", not
+    // merely that some markup exists. Partial legacy entries are rebuilt here
+    // until they contain measured natural geometry.
+    if (existingWarmEntry?.markup && existingWarmEntry?.metrics?.naturalSize) return;
+
+    const staging = document.createElement("div");
+    if (kind === "figure") {
+      await ensureFigureRendererReady();
+      const caption = contextTools.floatCaption(source, context, "figure");
+      const prepared = contextTools.prepareDocumentCommands(
+        source,
+        Number(context.openStart ?? entry.sourceIndex ?? 0),
+        caption?.text || entry.caption || ""
+      );
+      const figure = renderFigurePopup(
+        context,
+        entry.number || contextTools.figurePreviewNumber(source, context),
+        prepared.body,
+        prepared.macros,
+        caption?.start ?? entry.captionSourceIndex
+      );
+      staging.appendChild(figure);
+      if (figure.__smarttexReadyPromise) await figure.__smarttexReadyPromise;
+    } else if (kind === "table") {
+      const tableContext = context?.environment?.match?.(/^table\*?$/i)
+        ? popupTableContext({ context }, source)
+        : context;
+      if (!tableContext) return;
+      const caption = contextTools.floatCaption(source, context, "table");
+      const preparedTable = contextTools.prepareDocumentCommands(
+        source,
+        Number(context.openStart ?? entry.sourceIndex ?? 0),
+        tableContext.source
+      );
+      const tablePopup = document.createElement("figure");
+      tablePopup.className = "smarttex-table-popup";
+      const rendered = tableRenderer.renderTable({ ...tableContext, source: preparedTable.body }, {
+        commandSide: null,
+        includeCaret: false,
+        contextTools,
+        document,
+        katex,
+        macros: preparedTable.macros,
+        trust: trustedKatexCommand,
+        sourceOffset: tableContext.contentStart
+      });
+      if (!rendered) return;
+      tablePopup.appendChild(rendered);
+      const preparedCaption = contextTools.prepareDocumentCommands(
+        source,
+        Number(context.openStart ?? entry.sourceIndex ?? 0),
+        caption?.text || entry.caption || ""
+      );
+      appendPopupCaption(
+        tablePopup,
+        "Table",
+        entry.number || contextTools.tablePreviewNumber(source, context),
+        preparedCaption.body,
+        preparedCaption.macros,
+        caption?.start ?? entry.captionSourceIndex
+      );
+      staging.appendChild(tablePopup);
+    } else {
+      const numbering = target.numbering || contextTools.equationPreviewNumbering?.(source, context);
+      const body = contextTools.previewBody(context, null, numbering, false);
+      const prepared = contextTools.prepareDocumentCommands(
+        source,
+        Number(context.openStart ?? entry.sourceIndex ?? 0),
+        body
+      );
+      katex.render(prepared.body, staging, {
+        displayMode: Boolean(context.display ?? true),
+        throwOnError: false,
+        strict: "ignore",
+        trust: trustedKatexCommand,
+        maxExpand: 1000,
+        maxSize: 25,
+        macros: {
+          ...prepared.macros,
+          "\\label": { tokens: [], numArgs: 1 },
+          "\\nonumber": "",
+          "\\notag": ""
+        }
+      });
+    }
+    if (staging.innerHTML) {
+      stabilizeCachedPreviewMedia(staging);
+      const stableMarkup = staging.innerHTML;
+      const equationSingleLine = kind === "equation"
+        ? equationPreviewIsSingleLine(context, staging)
+        : false;
+      const metrics = await measureBackgroundPreviewMarkup(
+        stableMarkup,
+        kind,
+        equationSingleLine
+      );
+      if (sourceSignature !== previewSourceSignature(currentState)) return;
+      if (!metrics?.naturalSize) return;
+      const mediaKeepalive = kind === "figure"
+        ? [...staging.querySelectorAll("img")].filter((image) => (
+            image.complete && Number(image.naturalWidth) > 0
+          ))
+        : null;
+      previewCacheSet(
+        previewBaseRenderCache,
+        baseKey,
+        stableMarkup,
+        metrics,
+        { mediaKeepalive }
+      );
+      // The source-line diagnostic represents a fully measured cache entry for
+      // the current source signature. It therefore predicts the actual fast
+      // opening path rather than a slower markup-only staged reuse.
+    }
+  }
+
+  function backgroundPreviewEntriesForState(state = currentState) {
+    const source = String(state?.value || "");
+    if (!source) return [];
+
+    const numbered = numberedOutlineEntriesForState(state).map((entry) => ({
+      ...entry,
+      smarttexOutlineEntry: true
+    }));
+    const entries = [...numbered];
+    const seen = new Set(numbered.map((entry) => (
+      `${String(entry.type || "")}::${Math.max(0, Number(entry.sourceIndex) || 0)}`
+    )));
+
+    // The File Outline only exposes numbered elements, but editor popups also
+    // exist for unnumbered display equations and captionless/starred floats.
+    // Populate their full-popup cache as well so "first open" does not become
+    // a cold render merely because an element has no outline row.
+    if (enabledFeatures.equations) {
+      const analysis = documentAnalysisForState(state);
+      if (!analysis.equations) {
+        analysis.equations = typeof contextTools.analyzeEquations === "function"
+          ? contextTools.analyzeEquations(source)
+          : contextTools.equationContexts(source);
+      }
+      for (const context of analysis.equations?.contexts || []) {
+        // Inline math is intentionally excluded from eager warming: documents
+        // can contain thousands of inline fragments, while the expensive popup
+        // latency reported by the user concerns display equation environments.
+        if (context?.display === false) continue;
+        const sourceIndex = Math.max(0, Number(context?.openStart) || 0);
+        const key = `equation::${sourceIndex}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        entries.push({
+          type: "equation",
+          sourceIndex,
+          context,
+          numbering: analysis.equations?.numberingByOpenStart?.get?.(sourceIndex) || null,
+          smarttexOutlineEntry: false
+        });
+      }
+    }
+
+    const addFloatStarts = (kind, expression, finder) => {
+      if (!finder) return;
+      expression.lastIndex = 0;
+      let match;
+      while ((match = expression.exec(source))) {
+        const context = finder(source, match.index + match[0].length);
+        if (!context) continue;
+        const sourceIndex = Math.max(0, Number(context.openStart ?? match.index) || 0);
+        const key = `${kind}::${sourceIndex}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const caption = contextTools.floatCaption?.(source, context, kind);
+        entries.push({
+          type: kind,
+          sourceIndex,
+          context,
+          caption: caption?.text || "",
+          captionSourceIndex: caption?.start,
+          smarttexOutlineEntry: false
+        });
+      }
+    };
+
+    if (enabledFeatures.figures) {
+      addFloatStarts(
+        "figure",
+        /\\begin\s*\{figure\*?\}/gi,
+        contextTools.findFigureContext?.bind(contextTools)
+      );
+    }
+    if (enabledFeatures.tables) {
+      addFloatStarts(
+        "table",
+        /\\begin\s*\{table\*?\}/gi,
+        (value, index) => (
+          contextTools.findTableFloatContext?.(value, index) ||
+          contextTools.findTableContext?.(value, index)
+        )
+      );
+    }
+    return entries;
+  }
+
+  function previewWarmYield(timeout = 800) {
+    return new Promise((resolve) => {
+      const keyboardDelay = Math.max(0, Number(interactionTasks?.keyboardIdleRemaining?.()) || 0);
+      if (keyboardDelay > 0) {
+        window.setTimeout(() => previewWarmYield(timeout).then(resolve), keyboardDelay);
+        return;
+      }
+      // Each environment can require KaTeX/layout/image work. Yield between
+      // entries so proactive warming never turns into a long main-thread task
+      // that competes with editor typing or scrolling.
+      if (typeof window.requestIdleCallback === "function") {
+        window.requestIdleCallback(() => resolve(), { timeout });
+      } else {
+        window.setTimeout(resolve, 0);
+      }
+    });
+  }
+
+  function schedulePreviewCacheWarm({ initial = false } = {}) {
+    if (previewCacheWarmTimer !== null) window.clearTimeout(previewCacheWarmTimer);
+    const generation = ++previewCacheWarmGeneration;
+    const signature = previewSourceSignature(currentState);
+
+    // Initial document load gets a shorter delay because the whole purpose of
+    // this pass is to have likely previews ready *before* their first opening.
+    // Subsequent edits use a calmer delay so typing remains the priority.
+    const startDelay = Math.max(
+      initial ? 40 : 500,
+      Number(interactionTasks?.keyboardIdleRemaining?.()) || 0
+    );
+    previewCacheWarmTimer = window.setTimeout(() => {
+      previewCacheWarmTimer = null;
+      const run = async () => {
+        if (generation !== previewCacheWarmGeneration || signature !== previewSourceSignature(currentState)) return;
+        const sourceLength = String(currentState?.value || "").length;
+        if (interactionTasks?.canRunBackgroundTask &&
+            !interactionTasks.canRunBackgroundTask(currentState, sourceLength)) return;
+        const cursorIndex = Number(currentState?.cursorIndex) || 0;
+        let entries;
+        try {
+          const collect = () => backgroundPreviewEntriesForState(currentState)
+              .slice()
+              .sort((left, right) => (
+                Math.abs((Number(left?.sourceIndex) || 0) - cursorIndex) -
+                Math.abs((Number(right?.sourceIndex) || 0) - cursorIndex)
+              ));
+          entries = interactionTasks?.runSync
+            ? interactionTasks.runSync("preview-cache-index", collect)
+            : collect();
+        } catch (error) {
+          // A just-received keyboard event may have invalidated the interaction
+          // task that background analysis inherited. Warming is opportunistic;
+          // abort this pass quietly and let the already-scheduled post-edit warm
+          // pass retry against the settled source instead of surfacing an
+          // unhandled AbortError.
+          if (interactionTasks?.isAbortError?.(error)) return;
+          throw error;
+        }
+
+        // Warm all previewable display environments progressively, not only a
+        // fixed first-N subset. Nearby elements are sorted first, so the likely
+        // next popup becomes hot quickly, while the remainder fills during idle
+        // periods without blocking the editor.
+        for (let index = 0; index < entries.length; index += 1) {
+          if (generation !== previewCacheWarmGeneration || signature !== previewSourceSignature(currentState)) return;
+          const entry = entries[index];
+          const taskToken = interactionTasks?.begin?.("preview-cache-entry") || null;
+          try {
+            taskCheckpoint(0, 1, taskToken);
+            const jobs = [buildBackgroundPopupCache(entry, signature)];
+            if (entry.smarttexOutlineEntry) jobs.push(cachedNumberedOutlineHoverPreview(entry));
+            await Promise.all(jobs);
+            taskCheckpoint(0, 1, taskToken);
+          } catch (_error) {
+            // A malformed/incomplete element is simply retried after the next
+            // source-state update; one bad environment must not abort warming.
+          } finally {
+            if (taskToken) interactionTasks?.end?.(taskToken);
+          }
+          await previewWarmYield(index < 6 ? 250 : 900);
+        }
+
+        const graphicItems = [...document.querySelectorAll('.file-tree-list [role="treeitem"]')]
+          .filter((item) => fileTreeGraphicItemFromNode(item))
+          .slice(0, 48);
+        for (let index = 0; index < graphicItems.length; index += 1) {
+          if (generation !== previewCacheWarmGeneration || signature !== previewSourceSignature(currentState)) return;
+          try { await cachedFileTreeHoverPreview(graphicItems[index]); } catch (_error) {
+            // Unavailable project files remain cold and are retried on hover.
+          }
+          if (index % 4 === 3) await previewWarmYield(900);
+        }
+
+        // Project-file resolution can lag the first editor-state event while
+        // CollabTeX is still constructing its file model. Repeat the initial
+        // warm pass once after it completes. Existing cache entries are skipped,
+        // so this retry is cheap and primarily fills figures whose assets were
+        // not resolvable during the very first background pass.
+        if (initial && generation === previewCacheWarmGeneration && signature === previewSourceSignature(currentState)) {
+          window.setTimeout(() => {
+            if (generation === previewCacheWarmGeneration && signature === previewSourceSignature(currentState)) {
+              schedulePreviewCacheWarm({ initial: false });
+            }
+          }, 750);
+        }
+      };
+
+      // Start in an idle period when available. A bounded timeout ensures that
+      // quiet documents actually become warm even if the browser never reports
+      // a perfectly idle frame because CollabTeX keeps background work active.
+      if (typeof window.requestIdleCallback === "function") {
+        window.requestIdleCallback(() => void run(), { timeout: initial ? 180 : 500 });
+      } else {
+        window.setTimeout(() => void run(), 0);
+      }
+    }, startDelay);
+  }
+
+  function warmPreviewCacheForStateContext(state, context) {
+    const exactKey = previewExactCacheKey(state, context);
+    // A cache entry is useful even before its geometry has been measured.
+    // Reusing cached markup and doing only the hidden measurement is still much
+    // cheaper than reparsing/rerendering the environment. Previously such
+    // markup-only entries were ignored here, which made cache use appear
+    // intermittent even though rendered content was already available.
+    const exact = normalizedPreviewCacheEntry(lruCacheGet(previewRenderCache, exactKey));
+    if (exact?.markup) {
+      return {
+        entry: exact,
+        exact: true,
+        measured: Boolean(exact.metrics?.naturalSize),
+        exactKey,
+        baseKey: previewBaseCacheKey(state, context)
+      };
+    }
+    const baseKey = previewBaseCacheKey(state, context);
+    const base = normalizedPreviewCacheEntry(lruCacheGet(previewBaseRenderCache, baseKey));
+    if (base?.markup) {
+      return {
+        entry: base,
+        exact: false,
+        measured: Boolean(base.metrics?.naturalSize),
+        exactKey,
+        baseKey
+      };
+    }
+    return null;
+  }
+
+  function previewHintMatchesState(hint, state) {
+    const previous = hint?.state;
+    return Boolean(
+      previous && state &&
+      String(previous.fileName || "") === String(state.fileName || "") &&
+      String(previous.value || "") === String(state.value || "") &&
+      Number(previous.cursorIndex) === Number(state.cursorIndex) &&
+      Number(previous.selectionFrom ?? previous.cursorIndex) === Number(state.selectionFrom ?? state.cursorIndex) &&
+      Number(previous.selectionTo ?? previous.cursorIndex) === Number(state.selectionTo ?? state.cursorIndex) &&
+      Boolean(previous.smarttexHoverPreview) === Boolean(state.smarttexHoverPreview)
+    );
+  }
+
+  async function tryFastWarmPreview(generation, hint = null) {
+    const state = previewStateForRender();
+    if (generation !== renderGeneration || !stateCanShowPreview(state)) return null;
+    const usableHint = hint?.generation === generation && previewHintMatchesState(hint, state)
+      ? hint
+      : null;
+    let context = usableHint?.context || null;
+    if (!context) {
+      try { context = findPreviewContext(state); } catch (_error) { return null; }
+    }
+    if (!context || previewContextIsDismissed(state, context)) return null;
+    const warm = usableHint?.warm || warmPreviewCacheForStateContext(state, context);
+    if (!warm) return null;
+
+    const contextId = previewContextId(state, context);
+    const contextChanged = contextId !== activeContextId;
+    if (contextChanged) {
+      activeContextId = contextId;
+      caretPlacementState = null;
+      lastSuccessfulMarkup = "";
+      activeFloatCaptionRenderInfo = null;
+      previewPositioned = false;
+      verticalScrollRepositionPending = false;
+      output.replaceChildren();
+    }
+    activePreviewContext = context;
+    activePreviewState = state;
+    applyPreviewPresentation(context);
+
+    if (context.kind === "figure") {
+      const number = contextTools.figurePreviewNumber(state.value, context);
+      previewMeta.textContent = number !== null ? `Figure ${number}` : "";
+      previewMeta.hidden = number === null;
+    } else if (context.kind === "table") {
+      const number = contextTools.tablePreviewNumber(state.value, context);
+      previewMeta.textContent = number !== null ? `Table ${number}` : "";
+      previewMeta.hidden = number === null;
+    } else {
+      previewMeta.textContent = "";
+      previewMeta.hidden = true;
+    }
+
+    const revealed = await revealCachedPreviewMarkup(
+      warm.entry, generation, contextId, { fast: true }
+    );
+    if (!revealed) return null;
+    return { ...warm, state, context, contextId };
+  }
+
   async function renderPreview(generation, loadingGeneration = null) {
     const taskToken = interactionTasks?.begin?.("popup-preview-render") || null;
     try {
     renderTimer = null;
-    await Promise.all([katexFontsReady, featureSettingsReady, popupSettingsReady]);
+    // A measured warm cache can be shown immediately: no spinner-paint delay,
+    // LaTeX rendering, media decode, intrinsic measurement, or fit pass is
+    // needed. Base (cursor-independent) equation caches are shown immediately
+    // and then refined below with the cursor-specific markup in the background.
+    await Promise.all([featureSettingsReady, popupSettingsReady]);
+    const renderHint = scheduledPreviewHint?.generation === generation
+      ? scheduledPreviewHint
+      : null;
+    if (renderHint) scheduledPreviewHint = null;
+    const warmPreview = await tryFastWarmPreview(generation, renderHint);
+    if (warmPreview) {
+      // Background warming stores cursor-independent equation markup. Once that
+      // base cache has populated the opening frame, do not immediately continue
+      // into a cold cursor-specific KaTeX render; doing so defeated first-open
+      // caching and made the popup diagnostic appear uncached. Cursor/source
+      // changes can update the already-visible equation in place later.
+      return;
+    }
+    if (!warmPreview && loadingGeneration !== null && loadingGeneration !== undefined) {
+      await nextPreviewFrame();
+      await nextPreviewFrame();
+      if (generation !== renderGeneration) return;
+    }
+    await katexFontsReady;
     taskCheckpoint(0, 1, taskToken);
     const state = previewStateForRender();
     // A superseded async render must never hide or invalidate the newer one.
@@ -4011,7 +7342,9 @@
       return;
     }
 
-    const context = findPreviewContext(state);
+    const context = renderHint && previewHintMatchesState(renderHint, state)
+      ? renderHint.context
+      : findPreviewContext(state);
     taskCheckpoint(0, 1, taskToken);
     if (!context) {
       hidePreview();
@@ -4083,19 +7416,25 @@
         : null)
     );
     const hasSelection = Boolean(activeSelection);
-    const caretInFigureCaption = Boolean(
-      isFigure &&
+    const caretInFloatCaption = Boolean(
+      (isFigure || isTable) &&
       !hasSelection &&
       collapsedCaretIsInsideCaption(state, floatCaption)
     );
-    if (caretInFigureCaption) {
+    if (caretInFloatCaption) {
+      // Establish caption ownership during the opening render itself. Waiting
+      // for a later editor-state callback leaves a race where the first real
+      // beforeinput event sees no caption lock and falls back to the generic
+      // popup lifecycle. Capturing the bounds now makes the first caption key
+      // behave exactly like subsequent in-place updates.
+      setCaptionPreviewLockFromCaption(state, context, floatCaption);
       caretPlacementState = contextTools.resolveCaretPlacement(
         floatCaption.text,
         Number(state.cursorIndex) - Number(floatCaption.start),
         caretPlacementState
       );
     } else {
-      caretPlacementState = (isFigure || hasSelection)
+      caretPlacementState = (isFigure || isTable || hasSelection)
         ? null
         : contextTools.resolveCaretPlacement(
           context.source,
@@ -4103,6 +7442,45 @@
           caretPlacementState
         );
     }
+    const exactRenderCacheKey = previewExactCacheKey(state, context);
+    const cachedExactEntry = normalizedPreviewCacheEntry(
+      lruCacheGet(previewRenderCache, exactRenderCacheKey)
+    );
+    let cachedOpeningRevealed = false;
+    const needsFloatCaretRefresh = Boolean(
+      caretInFloatCaption ||
+      (isTable && !hasSelection && context.cursorInsideTable !== false)
+    );
+    if (cachedExactEntry) {
+      const revealed = await revealCachedPreviewMarkup(
+        cachedExactEntry,
+        generation,
+        contextId
+      );
+      if (revealed) {
+        // Float caches deliberately strip transient caret DOM so one cached
+        // rendering can serve every caret position. A cache hit must therefore
+        // remain visible immediately but continue into the lightweight caret
+        // refresh when the editor caret is in a caption (or table body), rather
+        // than returning with a caret-less cached caption.
+        cachedOpeningRevealed = true;
+        if (!needsFloatCaretRefresh) return;
+      }
+    }
+
+    const baseRenderCacheKey = previewBaseCacheKey(state, context);
+    const cachedBaseEntry = contextChanged
+      ? normalizedPreviewCacheEntry(lruCacheGet(previewBaseRenderCache, baseRenderCacheKey))
+      : null;
+    if (cachedBaseEntry) {
+      const revealed = await revealCachedPreviewMarkup(cachedBaseEntry, generation, contextId);
+      if (generation !== renderGeneration || contextId !== activeContextId) return;
+      cachedOpeningRevealed ||= Boolean(revealed);
+      // Continue below to add cursor/selection-specific state without discarding
+      // the already-visible cached frame. For figure captions this becomes a
+      // caption-only DOM update, so cached media remains untouched.
+    }
+
     let equationRenderContext = context;
     if (!isTable && !isFigure && hasSelection) {
       const relativeStart = Math.max(
@@ -4125,7 +7503,7 @@
       };
     }
     let unpreparedBody;
-    if (caretInFigureCaption) {
+    if (caretInFloatCaption) {
       const captionSource = String(floatCaption.text || "");
       const literalOffset = Math.max(
         0,
@@ -4215,23 +7593,34 @@
       "\\SmartTeXOperatorCaret":
         "\\htmlClass{smarttex-rendered-operator-caret}{\\vphantom{|}}"
     };
+    activeFloatCaptionRenderInfo = (isFigure || isTable)
+      ? {
+          contextId,
+          labelText: isTable ? "Table" : "Fig.",
+          number: isTable ? numbering.tableNumber : numbering.figureNumber,
+          macros: { ...macros },
+          sourceOffset: floatCaption?.start ?? null
+        }
+      : null;
 
-    const renderedFigure = isFigure && !contextChanged
+    const renderedFigure = isFigure && (!contextChanged || cachedOpeningRevealed)
       ? output.querySelector(":scope > .smarttex-figure-popup")
       : null;
-    const renderedTable = isTable && !contextChanged
+    const renderedTable = isTable && (!contextChanged || cachedOpeningRevealed)
       ? output.querySelector(":scope > .smarttex-table-popup")
       : null;
+    const renderedFloat = renderedFigure || renderedTable;
     const updateCaptionOnly = Boolean(
-      renderedFigure &&
-      caretInFigureCaption
+      renderedFloat &&
+      caretInFloatCaption
     );
 
     try {
       if (updateCaptionOnly) {
-        updateFigureCaptionInPlace(
-          renderedFigure,
-          numbering.figureNumber,
+        updateFloatCaptionInPlace(
+          renderedFloat,
+          isTable ? "Table" : "Fig.",
+          isTable ? numbering.tableNumber : numbering.figureNumber,
           documentCommands.body,
           macros,
           floatCaption?.start
@@ -4245,36 +7634,49 @@
           floatCaption?.start
         ));
       } else if (isTable) {
-        const tablePopup = document.createElement("figure");
-        tablePopup.className = "smarttex-table-popup";
-        tablePopup.appendChild(tableRenderer.renderTable(context, {
-          commandSide: caretPlacementState?.commandSide || null,
-          includeCaret: !hasSelection && context.cursorInsideTable !== false,
-          contextTools,
-          document,
-          katex,
-          macros,
-          trust: trustedKatexCommand,
-          sourceOffset: context.contentStart
-        }));
-        appendPopupCaption(
-          tablePopup,
-          "Table",
-          numbering.tableNumber,
-          documentCommands.body,
-          macros,
-          floatCaption?.start
-        );
-        staging.appendChild(tablePopup);
+        await renderWithTransientRetries(() => {
+          staging.replaceChildren();
+          const tablePopup = document.createElement("figure");
+          tablePopup.className = "smarttex-table-popup";
+          const renderedTableNode = tableRenderer.renderTable(context, {
+            commandSide: caretPlacementState?.commandSide || null,
+            includeCaret: !hasSelection && context.cursorInsideTable !== false,
+            contextTools,
+            document,
+            katex,
+            macros,
+            trust: trustedKatexCommand,
+            sourceOffset: context.contentStart
+          });
+          if (!renderedTableNode) {
+            throw new Error("Table renderer returned no preview content.");
+          }
+          tablePopup.appendChild(renderedTableNode);
+          appendPopupCaption(
+            tablePopup,
+            "Table",
+            numbering.tableNumber,
+            documentCommands.body,
+            macros,
+            floatCaption?.start
+          );
+          staging.appendChild(tablePopup);
+        });
       } else {
-        katex.render(documentCommands.body, staging, {
-          displayMode: Boolean(context.display),
-          throwOnError: true,
-          strict: "ignore",
-          trust: trustedKatexCommand,
-          maxExpand: 1000,
-          maxSize: 25,
-          macros
+        await renderWithTransientRetries(() => {
+          staging.replaceChildren();
+          katex.render(documentCommands.body, staging, {
+            displayMode: Boolean(context.display),
+            throwOnError: true,
+            strict: "ignore",
+            trust: trustedKatexCommand,
+            maxExpand: 1000,
+            maxSize: 25,
+            macros
+          });
+          if (!staging.firstElementChild && !String(staging.textContent || "").trim()) {
+            throw new Error("Equation renderer returned no preview content.");
+          }
         });
       }
     } catch (error) {
@@ -4316,16 +7718,21 @@
             "\\SmartTeXCaret": macros["\\SmartTeXCaret"],
             "\\SmartTeXOperatorCaret": macros["\\SmartTeXOperatorCaret"]
           };
-          staging.replaceChildren();
-          katex.render(fallbackCommands.body, staging, {
-            displayMode: Boolean(context.display),
-            throwOnError: true,
-            strict: "ignore",
-            trust: trustedKatexCommand,
-            maxExpand: 1000,
-            maxSize: 25,
-            macros: fallbackMacros
-          });
+          await renderWithTransientRetries(() => {
+            staging.replaceChildren();
+            katex.render(fallbackCommands.body, staging, {
+              displayMode: Boolean(context.display),
+              throwOnError: true,
+              strict: "ignore",
+              trust: trustedKatexCommand,
+              maxExpand: 1000,
+              maxSize: 25,
+              macros: fallbackMacros
+            });
+            if (!staging.firstElementChild && !String(staging.textContent || "").trim()) {
+              throw new Error("Equation fallback returned no preview content.");
+            }
+          }, 2);
         } catch (fallbackError) {
           if (interactionTasks?.isAbortError?.(fallbackError)) throw fallbackError;
           showRenderError(contextId, context, fallbackError);
@@ -4337,9 +7744,16 @@
       }
     }
 
+    if (isFigure && !updateCaptionOnly) {
+      const stagedFigure = staging.querySelector(":scope > .smarttex-figure-popup");
+      if (stagedFigure?.__smarttexReadyPromise) {
+        await stagedFigure.__smarttexReadyPromise;
+      }
+    }
+
     taskCheckpoint(0, 1, taskToken);
     if (generation !== renderGeneration || contextId !== activeContextId) return;
-    if (renderedTable) {
+    if (renderedTable && !updateCaptionOnly) {
       const nextTable = staging.querySelector(":scope > .smarttex-table-popup");
       if (nextTable) {
         const scrollState = capturePopupScrollState(renderedTable);
@@ -4349,7 +7763,20 @@
     } else if (!updateCaptionOnly) {
       output.replaceChildren(...staging.childNodes);
     }
+    updateEquationPreviewLineMode(context, output);
+    stabilizeCachedPreviewMedia(output);
     lastSuccessfulMarkup = output.innerHTML;
+    const cacheableMarkup = (!hasSelection)
+      ? canonicalPreviewBaseMarkup(lastSuccessfulMarkup)
+      : lastSuccessfulMarkup;
+    if (cacheableMarkup) {
+      previewCacheSet(
+        previewRenderCache,
+        exactRenderCacheKey,
+        cacheableMarkup,
+        normalizedPreviewCacheEntry(previewRenderCache.get(exactRenderCacheKey))?.metrics || null
+      );
+    }
     restorePopupScrollState(preview, previewScrollState);
     applyPopupSelectionHighlight(output, state, context);
     if (!updateCaptionOnly) {
@@ -4360,14 +7787,48 @@
     status.hidden = true;
     status.removeAttribute("title");
     preview.classList.remove("smarttex-preview-stale");
-    preview.hidden = false;
-    preview.classList.add("smarttex-preview-visible");
-    previewPopupUI?.refresh?.({ rebase: contextChanged });
-    refreshPreviewZoom();
-    window.requestAnimationFrame(() => {
-      if (contextChanged || !previewPositioned) positionPreview();
-      else positionPreviewAtCursor();
-    });
+    const stagedOpening = (
+      contextChanged ||
+      preview.hidden ||
+      preview.dataset.smarttexStaging === "true"
+    );
+    if (stagedOpening) {
+      const revealed = await revealStagedPreview(generation, contextId, { rebase: true });
+      if (!revealed) return;
+      if (cacheableMarkup && revealed.metrics) {
+        previewCacheSet(previewRenderCache, exactRenderCacheKey, cacheableMarkup, revealed.metrics);
+        // Keep one cursor-independent measured rendering for every unselected
+        // environment. This is the fast path used when the caret later moves
+        // inside the same figure/table/equation without a source change.
+        if (!hasSelection) {
+          previewCacheSet(
+            previewBaseRenderCache,
+            baseRenderCacheKey,
+            cacheableMarkup,
+            revealed.metrics
+          );
+        }
+      }
+    } else {
+      preview.hidden = false;
+      preview.classList.add("smarttex-preview-visible");
+      // Do not schedule popup-gate's visibility-size restore on every live
+      // equation/caption update. That asynchronous restore can reinterpret the
+      // already-fitted rectangle as a new natural size and is one source of
+      // cache/fresh-path divergence. The live fit below owns resizing here.
+      refreshPreviewZoom();
+      const prepared = {
+        maxWidth: Number(preview.dataset.smarttexAutoFitMaxWidth) || undefined,
+        maxHeight: Number(preview.dataset.smarttexAutoFitMaxHeight) || undefined
+      };
+      await applyPreviewAutoFitPolicy(prepared, {
+        allowGrow: preview.dataset.smarttexTemporarySized !== "true"
+      });
+      window.requestAnimationFrame(() => {
+        if (!previewPositioned) positionPreview();
+        else positionPreviewAtCursor();
+      });
+    }
     } finally {
       hidePreviewLoading(loadingGeneration);
       if (taskToken) interactionTasks?.end?.(taskToken);
@@ -4398,7 +7859,13 @@
     });
   }
 
-  function scheduleRender({ immediate = false, preserveExisting = false } = {}) {
+  function scheduleRender({
+    immediate = false,
+    preserveExisting = false,
+    delayMs = SOURCE_RENDER_DELAY_MS,
+    deferContextLookup = false,
+    contextHint = null
+  } = {}) {
     if (renderTimer !== null) {
       window.clearTimeout(renderTimer);
       renderTimer = null;
@@ -4410,20 +7877,66 @@
       hidePreview();
       return;
     }
-    const context = findPreviewContext(state);
+
+    // Defense in depth for the mounted-environment ownership invariant above.
+    // Other extension subsystems can request scheduleRender() independently of
+    // the editor-state listener. If the caret still belongs to the currently
+    // mounted environment, a generic render of that same environment is never
+    // appropriate: equations/captions have dedicated in-place update paths and
+    // focus/layout events need no rerender at all. Refusing the redundant job
+    // here prevents a stale asynchronous transaction from staging/revealing the
+    // popup a second time after a live update.
+    if (
+      !preview.hidden &&
+      (
+        activeEnvironmentPreviewContainsState(state) ||
+        activeEnvironmentInputTransactionContainsState(state)
+      )
+    ) {
+      let requestedContext = contextHint || null;
+      if (!requestedContext && !deferContextLookup) {
+        try { requestedContext = findPreviewContext(state); } catch (_error) {
+          requestedContext = null;
+        }
+      }
+      if (!requestedContext || previewContextId(state, requestedContext) === activeContextId) {
+        hidePreviewLoading();
+        return;
+      }
+    }
+    // A manually dismissed environment stays dismissed while edits occur
+    // inside it. This check intentionally avoids parsing the environment on
+    // every keystroke and also accounts for the source-length change.
+    if (stateIsInsideDismissedPreview(state)) {
+      hidePreview({ clearDismissal: false, force: true });
+      return;
+    }
+    if (deferContextLookup && !immediate) {
+      renderGeneration += 1;
+      const generation = renderGeneration;
+      renderTimer = window.setTimeout(
+        () => runScheduledRender(generation, null),
+        Math.max(0, Number(delayMs) || 0)
+      );
+      return;
+    }
+    const context = contextHint || findPreviewContext(state);
     if (!context) {
       if (preserveExisting && !preview.hidden) return;
       hidePreview();
       return;
     }
     if (previewContextIsDismissed(state, context)) {
-      hidePreview({ clearDismissal: false });
+      hidePreview({ clearDismissal: false, force: true });
       return;
     }
     renderGeneration += 1;
     const generation = renderGeneration;
+    const warm = warmPreviewCacheForStateContext(state, context);
+    scheduledPreviewHint = { generation, state, context, warm };
     const loadingGeneration = showPreviewLoading(state, context);
-    if (immediate) {
+    const warmCacheReady = Boolean(warm);
+    if (immediate || warmCacheReady) {
       // The page bridge already coalesces duplicate cursor callbacks in a
       // microtask. Do not add a timeout before moving the rendered caret.
       queueMicrotask(() => {
@@ -4437,7 +7950,7 @@
     }
     renderTimer = window.setTimeout(
       () => runScheduledRender(generation, loadingGeneration),
-      SOURCE_RENDER_DELAY_MS
+      Math.max(0, Number(delayMs) || 0)
     );
   }
 
@@ -4602,17 +8115,59 @@
     if (wasActive && stateCanShowPreview(currentState)) scheduleRender();
   });
 
+  ensureNumberedOutlineObserver();
+
   window.addEventListener(STATE_EVENT, (event) => {
     const previousState = currentState;
     const previousSource = String(previousState?.value || "");
     const previousFileName = String(previousState?.fileName || "");
     try {
-      currentState = JSON.parse(String(event.detail || "null"));
+      currentState = interactionTasks?.parseEditorState
+        ? interactionTasks.parseEditorState(event.detail)
+        : JSON.parse(String(event.detail || "null"));
     } catch (_error) {
       hoverPreviewState = null;
       hidePreview();
       hideCaptionReferencePopup();
       return;
+    }
+
+    if (
+      numberedOutlinePendingCursorIndex !== null &&
+      Math.max(0, Number(currentState?.cursorIndex) || 0) === numberedOutlinePendingCursorIndex
+    ) {
+      clearNumberedOutlinePendingCursor();
+    }
+    ensureNumberedOutlineObserver();
+    // CollabTeX may replace the outline subtree while it reconciles the current
+    // section after a cursor move. The pane observer normally notices that, but
+    // its pending repair is deliberately cancelled by keyboard activity. Every
+    // post-input editor state therefore gets one idle-time reconciliation as the
+    // guaranteed retry, even when the source itself did not change.
+    scheduleNumberedOutlineUpdate(20);
+    scheduleNumberedOutlineActiveIndicator();
+
+    const currentSource = String(currentState?.value || "");
+    const currentFileName = String(currentState?.fileName || "");
+    const sourceChanged = (
+      previousSource !== currentSource ||
+      previousFileName !== currentFileName
+    );
+    if (sourceChanged) {
+      // Every preview cache key includes the source signature. Once the source
+      // changes, old diagnostic dots would be misleading even though their LRU
+      // entries may remain allocated until eviction. Clear the visible cache map
+      // immediately; the idle warmer repopulates dots as new entries complete.
+
+      // Cache warming is deliberately independent of popup-interaction gating.
+      // The previous implementation returned here during initial page load, so
+      // no full popup cache existed until the user edited the document. That
+      // made the first figure/equation/table opening cold even after the page
+      // had been idle for a long time. Start warming as soon as source state is
+      // available; display gating still prevents any popup from appearing early.
+      schedulePreviewCacheWarm({
+        initial: !previousState || previousFileName !== currentFileName
+      });
     }
 
     if (!popupInteractionReady()) {
@@ -4621,27 +8176,38 @@
       hideCaptionReferencePopup();
       return;
     }
-
-    const currentSource = String(currentState?.value || "");
-    const currentFileName = String(currentState?.fileName || "");
-    const sourceChanged = (
-      previousSource !== currentSource ||
-      previousFileName !== currentFileName
-    );
-    const continuingActivePreview = Boolean(
-      sourceChanged && stateContinuesActiveEnvironmentPreview(currentState)
-    );
     const recentEditorTyping = Boolean(
       sourceChanged &&
       Date.now() - lastEditorTextInputAt < 500 &&
       previousState?.focused !== false &&
       previousFileName === currentFileName
     );
-    if (recentEditorTyping) {
+    const cheapCaptionContinuation = Boolean(
+      recentEditorTyping &&
+      captionPreviewLock &&
+      !preview.hidden &&
+      ["figure", "table"].includes(activePreviewContext?.kind)
+    );
+    const inputTransactionContinuesPreview = Boolean(
+      !preview.hidden &&
+      sourceChanged &&
+      activeEnvironmentInputTransactionContainsState(currentState)
+    );
+    const continuingActivePreview = Boolean(
+      !preview.hidden &&
+      (
+        cheapCaptionContinuation ||
+        activeEnvironmentPreviewContainsState(currentState) ||
+        inputTransactionContinuesPreview
+      )
+    );
+    if (recentEditorTyping || (sourceChanged && continuingActivePreview)) {
       // CodeMirror/Ace can publish the document change before the next layout
       // pass has produced caret coordinates, and some versions briefly report
-      // focus=false while replacing the hidden input value. Neither transient
-      // state ends the caption-editing interaction.
+      // focus=false while replacing the hidden input value. If the caret range
+      // still belongs to the already-open environment, neither transient state
+      // ends that interaction—even when the state notification arrives later
+      // than the generic 500 ms "recent typing" heuristic.
       currentState.focused = true;
       if (!currentState.screen && previousState?.screen) {
         currentState.screen = previousState.screen;
@@ -4665,7 +8231,133 @@
       Number(previousState?.selectionTo) !== Number(currentState?.selectionTo)
     );
     const focusChanged = Boolean(previousState?.focused) !== Boolean(currentState?.focused);
-    refreshCaptionPreviewLock(currentState);
+
+    // If the state belongs to the input transaction but carries a transient
+    // out-of-range cursor, do not let a parser-based caption lookup clear the
+    // existing caption lock. The DOM input event already proved that the edit
+    // started inside this caption; only its end offset needs to track the source
+    // length change until the corrected caret state arrives.
+    if (inputTransactionContinuesPreview && activeEnvironmentInputTransaction?.captionLocked) {
+      refreshCaptionLockFromInputTransaction(currentState);
+    } else {
+      refreshCaptionPreviewLock(currentState);
+    }
+
+    // Once an environment popup is mounted, that environment exclusively owns
+    // the popup until the caret actually leaves its source range. Handle every
+    // editor state mutation for the owned environment here and RETURN before any
+    // generic popup scheduling below. This single ownership gate is deliberately
+    // stronger than separate typing/focus/scroll heuristics: CollabTeX can emit
+    // several state notifications for one keypress and their order differs
+    // between editor versions. Allowing even one of those notifications to reach
+    // scheduleRender() is enough to create the observed update -> close -> reopen
+    // cycle. It also used to let the equation-session guard swallow arrow-key
+    // caret updates.
+    if (continuingActivePreview && (sourceChanged || cursorChanged)) {
+      cancelPendingEnvironmentPreviewRender();
+      const activeKind = previewElementKind(activePreviewContext);
+
+      if (activeKind === "equation") {
+        // Reconstruct the equation against the latest source before updating the
+        // active state snapshot. activeEquationTypingContext() falls back to the
+        // retained environment range when the just-typed TeX is temporarily
+        // unparsable, so the mounted popup never needs to disappear between
+        // intermediate keystrokes. Cursor-only changes run immediately so the
+        // SmartTeX caret marker follows every arrow key.
+        const liveContext = activeEquationTypingContext(currentState);
+        if (liveContext) {
+          activePreviewContext = liveContext;
+          activePreviewState = {
+            ...activePreviewState,
+            ...currentState,
+            focused: true,
+            screen: currentState.screen || activePreviewState?.screen
+          };
+          refreshLiveEquationEditSession(currentState, liveContext);
+          typedEnvironmentPreviewActive = environmentPopupUsesHover();
+          hoverPreviewState = null;
+          scheduleLiveEquationUpdate(currentState, liveContext, {
+            immediate: !sourceChanged
+          });
+        } else {
+          // Even an unexpected parser failure must not hand control back to the
+          // generic lifecycle while the retained environment range says the
+          // caret is still inside this equation. In particular, do not replace
+          // activePreviewState.value with a transient input-transaction state
+          // whose cursor is outside the environment: the corrected state needs
+          // the old source length to reconstruct the edited equation reliably.
+          if (!inputTransactionContinuesPreview) {
+            activePreviewState = {
+              ...activePreviewState,
+              ...currentState,
+              focused: true,
+              screen: currentState.screen || activePreviewState?.screen
+            };
+          }
+          hidePreviewLoading();
+        }
+        return;
+      }
+
+      if (activeKind === "figure" || activeKind === "table") {
+        if (sourceChanged) {
+          // Keep the retained float boundary synchronized before replacing the
+          // active source snapshot. Caption edits then update only the caption DOM
+          // and common fit solver; edits elsewhere in the same float deliberately
+          // leave the last valid popup mounted rather than closing/reopening it.
+          advanceActiveEnvironmentRangeForSourceEdit(currentState);
+          if (
+            captionPreviewIsLocked() ||
+            (inputTransactionContinuesPreview && activeEnvironmentInputTransaction?.captionLocked)
+          ) {
+            scheduleLiveCaptionUpdate(currentState);
+          }
+        } else if (cursorChanged && captionPreviewIsLocked()) {
+          // Arrow-key movement inside a caption updates the rendered caption
+          // caret immediately, matching the equation-preview caret behavior.
+          // The mounted figure/table and popup position are preserved.
+          scheduleLiveCaptionUpdate(currentState, { immediate: true });
+        }
+        activePreviewState = {
+          ...activePreviewState,
+          ...currentState,
+          focused: true,
+          screen: currentState.screen || activePreviewState?.screen
+        };
+        hidePreviewLoading();
+        if (!sourceChanged) {
+          // Cursor-only movement uses the proximity rule but never re-anchors an
+          // already visible popup. Source edits are positioned by the live
+          // caption updater after it has finished resizing the same DOM.
+          const rect = preview.getBoundingClientRect();
+          if (!previewPositioned && rect.width > 0 && rect.height > 0) {
+            previewPositioned = true;
+          }
+          window.requestAnimationFrame(() => positionPreviewAtCursor());
+        }
+        return;
+      }
+    }
+
+    if (continuingActivePreview && !sourceChanged && !cursorChanged) {
+      // Focus/screen/layout notifications belonging to the same mounted
+      // environment are bookkeeping, not popup-open requests. Absorb them here
+      // so they cannot trigger a redundant generic render after an in-place edit.
+      activePreviewState = {
+        ...activePreviewState,
+        ...currentState,
+        focused: true,
+        screen: currentState.screen || activePreviewState?.screen
+      };
+      hidePreviewLoading();
+      window.requestAnimationFrame(() => positionPreviewAtCursor());
+      return;
+    }
+
+    // The legacy live variables below are kept only for non-owned fallback
+    // paths. Owned environments have already returned above.
+    const liveEquationContext = null;
+    const liveCaptionEditing = false;
 
     if (popupsSuppressedAfterEditorScroll) {
       if (sourceChanged || cursorChanged || focusChanged) {
@@ -4695,6 +8387,71 @@
       }
     } else {
       updateCursorTriggeredReferencePopup(currentState);
+    }
+
+    if (liveEquationContext) {
+      // Equation typing is an in-place update transaction. It must not fall
+      // through the ordinary cursor-trigger lifecycle, because a transient
+      // parser miss there can hide the popup. Keep its position and last valid
+      // rendering, then replace/refit the content when KaTeX accepts the edit.
+      typedEnvironmentPreviewActive = environmentPopupUsesHover();
+      hoverPreviewState = null;
+      scheduleLiveEquationUpdate(currentState, liveEquationContext);
+      return;
+    }
+
+    if (liveCaptionEditing) {
+      // Advance the retained float boundaries before replacing activePreviewState
+      // with the new source snapshot. applyLiveCaptionUpdate() runs 48 ms later;
+      // if the state were replaced first its length delta would be zero and the
+      // stored environment close position would remain stale on the next key.
+      advanceActiveEnvironmentRangeForSourceEdit(currentState);
+      activePreviewState = {
+        ...activePreviewState,
+        ...currentState,
+        screen: currentState.screen || activePreviewState?.screen
+      };
+      hidePreviewLoading();
+      window.requestAnimationFrame(() => positionPreviewAtCursor());
+      return;
+    }
+
+    if (liveEquationEditSessionContainsState(currentState)) {
+      // CollabTeX often emits a second state notification after the text-change
+      // event (focus/screen/cursor bookkeeping). Previously that notification
+      // fell into the generic hover/cursor trigger and closed/reopened the popup.
+      // While the caret remains in the active equation, absorb those secondary
+      // notifications and leave the live popup untouched. hidePreview() carries
+      // the same session veto so later scroll/hover cleanup cannot undo this
+      // decision after this state callback has returned.
+      currentState.focused = true;
+      if (!currentState.screen && previousState?.screen) currentState.screen = previousState.screen;
+      activePreviewState = { ...activePreviewState, ...currentState };
+      hidePreviewLoading();
+      window.requestAnimationFrame(() => positionPreviewAtCursor());
+      return;
+    }
+
+    if (!sourceChanged && cursorChanged && continuingActivePreview) {
+      // Arrow-key/caret movement inside an already-open environment is not a
+      // new popup request. Equations additionally need an in-place KaTeX refresh
+      // so the rendered caret marker follows the editor caret; figure/table
+      // captions keep their existing content and only run the safety relocation
+      // check. Neither case is allowed to enter the generic reopen pipeline.
+      activePreviewState = { ...activePreviewState, ...currentState };
+      hidePreviewLoading();
+      if (previewElementKind(activePreviewContext) === "equation") {
+        const hasSelection = Number(currentState.selectionFrom) !== Number(currentState.selectionTo);
+        if (!hasSelection) {
+          const cursorContext = activeEquationTypingContext(currentState);
+          if (cursorContext) {
+            scheduleLiveEquationUpdate(currentState, cursorContext, { immediate: true });
+            return;
+          }
+        }
+      }
+      window.requestAnimationFrame(() => positionPreviewAtCursor());
+      return;
     }
 
     if (environmentPopupUsesHover()) {
@@ -4770,9 +8527,19 @@
       return;
     }
 
+    const captionTypingActive = Boolean(
+      recentEditorTyping &&
+      captionPreviewLock &&
+      !preview.hidden &&
+      ["figure", "table"].includes(activePreviewContext?.kind)
+    );
     scheduleRender({
       immediate: !sourceChanged,
-      preserveExisting: recentEditorTyping || continuingActivePreview
+      preserveExisting: recentEditorTyping || continuingActivePreview,
+      delayMs: captionTypingActive
+        ? CAPTION_TYPING_RENDER_DELAY_MS
+        : SOURCE_RENDER_DELAY_MS,
+      deferContextLookup: captionTypingActive
     });
   });
 
@@ -4806,6 +8573,9 @@
   }, true);
   document.addEventListener("pointerdown", (event) => {
     popupsSuppressedAfterEditorScroll = false;
+    // Pointer navigation is explicit and therefore ends any short input-state
+    // bridge immediately; subsequent state is allowed to close/switch previews.
+    activeEnvironmentInputTransaction = null;
     if (
       referencePopupContains(event.target) ||
       autocompleteSurface(event.target) ||
@@ -4895,7 +8665,10 @@
     }
   });
   attachOptionsButton();
-  const optionsButtonObserver = new MutationObserver(attachOptionsButton);
+  const optionsButtonObserver = new MutationObserver(() => {
+    if (optionsButton.isConnected && optionsButtonSlot?.isConnected) return;
+    attachOptionsButton();
+  });
   optionsButtonObserver.observe(document.documentElement, {
     childList: true,
     subtree: true
@@ -4905,10 +8678,24 @@
   // run for every caret repaint and editor layout update. The resulting global
   // query plus computed-style/layout reads blocked ordinary typing. Keyboard
   // and pointer selection changes are already handled by the listeners below.
+  const GRAPHIC_AUTOCOMPLETE_DOM_SELECTOR = [
+    ".ace_autocomplete",
+    ".ace_autocomplete_popup",
+    "#smarttex-figure-autocomplete-popup",
+    "[role='listbox']"
+  ].join(",");
+  const graphicAutocompleteMutation = (mutation) => {
+    const target = mutation.target instanceof Element ? mutation.target : mutation.target?.parentElement;
+    if (target?.closest?.(GRAPHIC_AUTOCOMPLETE_DOM_SELECTOR)) return true;
+    return [...mutation.addedNodes, ...mutation.removedNodes].some((node) => (
+      node instanceof Element && (
+        node.matches(GRAPHIC_AUTOCOMPLETE_DOM_SELECTOR) ||
+        node.querySelector(GRAPHIC_AUTOCOMPLETE_DOM_SELECTOR)
+      )
+    ));
+  };
   const graphicAutocompleteObserver = new MutationObserver((mutations) => {
-    if (mutations.some((mutation) => mutation.type === "childList")) {
-      scheduleGraphicAutocompletePreviewUpdate();
-    }
+    if (mutations.some(graphicAutocompleteMutation)) scheduleGraphicAutocompletePreviewUpdate();
   });
   graphicAutocompleteObserver.observe(document.documentElement, {
     childList: true,
@@ -4927,7 +8714,25 @@
     scheduleGraphicAutocompletePreviewUpdate();
   });
   const noteEditorTextInput = (event) => {
-    if (editorSurface(event.target)) lastEditorTextInputAt = Date.now();
+    if (!editorSurface(event.target)) return;
+    const now = Date.now();
+    lastEditorTextInputAt = now;
+    if (!preview.hidden && activeEnvironmentPreviewContainsState(currentState)) {
+      // Capture ownership from the real DOM input event, before CollabTeX emits
+      // any potentially transient editor-state snapshots. This transaction is
+      // intentionally short-lived; it only bridges the non-atomic input/state
+      // publication window and never changes normal arrow-key/pointer navigation.
+      activeEnvironmentInputTransaction = {
+        contextId: activeContextId,
+        fileName: String(currentState?.fileName || ""),
+        kind: previewElementKind(activePreviewContext),
+        captionLocked: captionPreviewIsLocked(),
+        sourceLength: String(currentState?.value || "").length,
+        expiresAt: now + 900
+      };
+    } else {
+      activeEnvironmentInputTransaction = null;
+    }
   };
   document.addEventListener("beforeinput", noteEditorTextInput, true);
   document.addEventListener("input", noteEditorTextInput, true);
@@ -4942,6 +8747,38 @@
     graphicAutocompleteHoveredEntry = entry;
     if (owner || changed) scheduleGraphicAutocompletePreviewUpdate();
   }, { capture: true, passive: true });
+
+  document.addEventListener("pointermove", (event) => {
+    updateStructureHoverPointer(event);
+  }, { capture: true, passive: true });
+  document.addEventListener("pointerover", (event) => {
+    const item = fileTreeGraphicItemFromNode(event.target);
+    if (!item) return;
+    if (event.relatedTarget instanceof Node && item.contains(event.relatedTarget)) return;
+    updateStructureHoverPointer(event);
+    // Native CollabTeX file entries often expose the path through title
+    // attributes. Suppress those browser tooltips for as long as SmartTeX's
+    // richer thumbnail hover target is active.
+    suppressStructureHoverTooltips(item);
+    scheduleStructureHoverPreview(item, () => cachedFileTreeHoverPreview(item), event);
+  }, true);
+  document.addEventListener("pointerout", (event) => {
+    const item = fileTreeGraphicItemFromNode(event.target);
+    if (!item) return;
+    if (event.relatedTarget instanceof Node && item.contains(event.relatedTarget)) return;
+    hideStructureHoverPreview();
+    if (structureHoverTooltipRoot === item) restoreStructureHoverTooltips();
+  }, true);
+  document.addEventListener("pointerdown", (event) => {
+    if (!event.target?.closest?.("#smarttex-structure-hover-preview")) {
+      hideStructureHoverPreview();
+    }
+  }, true);
+  window.addEventListener("scroll", () => hideStructureHoverPreview(), true);
+  window.addEventListener("blur", () => {
+    hideStructureHoverPreview();
+    restoreStructureHoverTooltips();
+  });
 
   window.addEventListener(RUNTIME_SETTINGS_EVENT, (event) => {
     const detail = event?.detail || {};
@@ -5023,6 +8860,23 @@
     }
   });
 
+  window.addEventListener("smarttex:set-popup-caption-font-scale", () => {
+    // The settings menu updates a root CSS variable immediately. Re-fit an open
+    // figure/table synchronously so a larger caption gets enough popup space,
+    // but do not rerender LaTeX/media or move a popup that is already positioned.
+    if (preview.hidden || !["figure", "table"].includes(preview.dataset.previewKind || "")) return;
+    const prepared = {
+      maxWidth: Number(preview.dataset.smarttexAutoFitMaxWidth) || undefined,
+      maxHeight: Number(preview.dataset.smarttexAutoFitMaxHeight) || undefined
+    };
+    window.requestAnimationFrame(() => {
+      if (preview.hidden) return;
+      applyPreviewAutoFitPolicyNow(prepared, {
+        allowGrow: preview.dataset.smarttexTemporarySized !== "true"
+      });
+    });
+  });
+
   window.addEventListener("resize", () => {
     positionPreview();
     repositionReferencePopups();
@@ -5035,8 +8889,17 @@
         captionContainerAtIndex(currentState) &&
         stateContinuesActiveEnvironmentPreview(currentState)
       );
+      // Typing can make CollabTeX auto-scroll the editor to keep the caret in
+      // view. An equation edit session is stronger evidence of an ongoing edit
+      // than the short generic input-time window, so never let that auto-scroll
+      // close the live equation popup merely because the scroll event arrives
+      // a few hundred milliseconds after the key event.
+      const activeEquationEdit = liveEquationEditSessionContainsState(currentState);
+      const activeEnvironmentEdit = activeEnvironmentPreviewContainsState(currentState);
       const keepTypingOverlays = Boolean(
         activeCaptionEdit ||
+        activeEquationEdit ||
+        activeEnvironmentEdit ||
         (
           Date.now() - lastEditorTextInputAt < 350 &&
           currentState?.focused !== false

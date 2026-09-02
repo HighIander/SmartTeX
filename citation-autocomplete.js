@@ -67,6 +67,7 @@
   let smartCitationsPresent = false;
   let initialParseAttemptedKey = "";
   let backgroundLoadParseAttemptedKey = "";
+  let ownershipRefreshTimer = 0;
   let lastOpenedFileName = "";
   let backgroundParseTimer = null;
   let scrollSuppressed = false;
@@ -969,6 +970,8 @@
     clearPopupTimer();
     window.clearTimeout(backgroundParseTimer);
     backgroundParseTimer = null;
+    window.clearTimeout(ownershipRefreshTimer);
+    ownershipRefreshTimer = 0;
     initialParseAttemptedKey = "";
     backgroundLoadParseAttemptedKey = "";
   });
@@ -1008,7 +1011,9 @@
 
   window.addEventListener(STATE_EVENT, (event) => {
     try {
-      currentState = JSON.parse(String(event.detail || "null"));
+      currentState = interactionTasks?.parseEditorState
+        ? interactionTasks.parseEditorState(event.detail)
+        : JSON.parse(String(event.detail || "null"));
     } catch (_error) {
       return;
     }
@@ -1121,7 +1126,6 @@
     lastTextInputAt = Date.now();
     scrollSuppressed = false;
   };
-  document.addEventListener("beforeinput", noteTextInput, true);
   document.addEventListener("input", noteTextInput, true);
 
   document.addEventListener("mousedown", (event) => {
@@ -1147,7 +1151,25 @@
     positionPopup();
   }, true);
 
-  const ownershipObserver = new MutationObserver(updateSmartCitationsPresence);
+  const scheduleSmartCitationsPresenceUpdate = () => {
+    if (ownershipRefreshTimer) return;
+    ownershipRefreshTimer = window.setTimeout(() => {
+      ownershipRefreshTimer = 0;
+      updateSmartCitationsPresence();
+    }, Math.max(0, Number(interactionTasks?.keyboardIdleRemaining?.()) || 0));
+  };
+  const smartCitationsMutation = (mutation) => {
+    const target = mutation.target instanceof Element ? mutation.target : mutation.target?.parentElement;
+    if (target?.closest?.(SMART_CITATIONS_SELECTOR)) return true;
+    return [...mutation.addedNodes, ...mutation.removedNodes].some((node) => (
+      node instanceof Element && (
+        node.matches(SMART_CITATIONS_SELECTOR) || node.querySelector(SMART_CITATIONS_SELECTOR)
+      )
+    ));
+  };
+  const ownershipObserver = new MutationObserver((mutations) => {
+    if (mutations.some(smartCitationsMutation)) scheduleSmartCitationsPresenceUpdate();
+  });
   ownershipObserver.observe(document.documentElement, {
     childList: true,
     subtree: true
@@ -1158,6 +1180,7 @@
   window.addEventListener("pagehide", () => {
     clearPopupTimer();
     window.clearTimeout(backgroundParseTimer);
+    window.clearTimeout(ownershipRefreshTimer);
     ownershipObserver.disconnect();
     setBridgeActive(false);
     pendingRequests.forEach((pending) => {

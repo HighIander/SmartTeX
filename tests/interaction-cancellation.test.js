@@ -11,6 +11,7 @@ const root = path.resolve(__dirname, "..");
 const listeners = new Map();
 let pendingChecks = 0;
 let forcePending = false;
+let now = 1000;
 
 class CustomEvent {
   constructor(type, options = {}) {
@@ -22,6 +23,9 @@ class CustomEvent {
 const sandbox = {
   console,
   CustomEvent,
+  Date: class extends Date {
+    static now() { return now; }
+  },
   navigator: {
     scheduling: {
       isInputPending(options) {
@@ -94,6 +98,30 @@ sandbox.navigator.scheduling.isInputPending = (options) => {
 const before = tasks.generation();
 for (const callback of listeners.get("wheel") || []) callback({ type: "wheel" });
 assert.equal(tasks.generation(), before + 1, "wheel input must invalidate active/scheduled work");
+
+let subscriberNotifications = 0;
+tasks.subscribe(() => { subscriberNotifications += 1; });
+for (const callback of listeners.get("keydown") || []) callback({ type: "keydown" });
+assert.equal(tasks.keyboardIdleMs, 500);
+assert.equal(tasks.keyboardIdleRemaining(), 500, "keyboard input must open a 500 ms idle window");
+assert.equal(tasks.isKeyboardIdle(), false);
+now += 10;
+for (const callback of listeners.get("beforeinput") || []) callback({ type: "beforeinput" });
+now += 10;
+for (const callback of listeners.get("input") || []) callback({ type: "input" });
+assert.equal(tasks.keyboardIdleRemaining(), 500, "each input must restart the idle window");
+assert.equal(subscriberNotifications, 1, "one edit transaction must fan out cancellation only once");
+now += 500;
+assert.equal(tasks.isKeyboardIdle(), true);
+
+const stateText = JSON.stringify({ value: "abc", cursor: { row: 0 }, screen: { pageX: 1 } });
+const firstState = tasks.parseEditorState(stateText);
+const secondState = tasks.parseEditorState(stateText);
+assert.notEqual(firstState, secondState, "consumers must receive independent state objects");
+assert.notEqual(firstState.cursor, secondState.cursor);
+assert.equal(tasks.canRunLongTask({ focused: true }, 500000), true);
+assert.equal(tasks.canRunBackgroundTask({ focused: true }, 500000), false);
+assert.equal(tasks.canRunBackgroundTask({ focused: false }, 500000), true);
 
 assert.throws(
   () => tasks.runSync("explicit-cancel", () => {

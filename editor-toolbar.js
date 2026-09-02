@@ -37,6 +37,7 @@
   let requestCounter = 0;
   let stateUpdateTimer = 0;
   let attachFrame = 0;
+  let attachTimer = 0;
   let overflowFrame = 0;
   let toolbarResizeObserver = null;
   let toolbarResizeTarget = null;
@@ -402,20 +403,26 @@
     stateUpdateTimer = window.setTimeout(() => {
       stateUpdateTimer = 0;
       updateEditingToolbarState();
-    }, Math.max(0, Number(delay) || 0));
+    }, Math.max(
+      Math.max(0, Number(delay) || 0),
+      Number(interactionTasks?.keyboardIdleRemaining?.()) || 0
+    ));
   }
 
   interactionTasks?.subscribe?.(() => {
     window.clearTimeout(stateUpdateTimer);
     stateUpdateTimer = 0;
-    // A fresh editor-state event normally schedules the next update. If the
-    // cancelled task belonged to the current state, retry only after the user
-    // has had time to continue typing or scrolling.
-    if (currentState) scheduleToolbarStateUpdate(180);
+    window.clearTimeout(attachTimer);
+    attachTimer = 0;
+    if (attachFrame) window.cancelAnimationFrame(attachFrame);
+    attachFrame = 0;
+    // A fresh editor-state event schedules both updates after keyboard idle.
   });
 
   function updateEditingToolbarState() {
     if (!editingToolbar || !currentState) return;
+    if (interactionTasks?.canRunLongTask &&
+        !interactionTasks.canRunLongTask(currentState, String(currentState.value || "").length)) return;
     const range = sourceSelectionRange();
     const commandButtons = [...editingToolbar.querySelectorAll(
       "button[data-smarttex-command]"
@@ -450,7 +457,7 @@
         : analyze();
     } catch (error) {
       if (interactionTasks?.isAbortError?.(error)) {
-        scheduleToolbarStateUpdate(180);
+        scheduleToolbarStateUpdate(500);
         return;
       }
       calculated = {
@@ -1327,7 +1334,16 @@
   }
 
   function scheduleAttachEditingToolbar() {
-    if (attachFrame) return;
+    const idleDelay = Math.max(0, Number(interactionTasks?.keyboardIdleRemaining?.()) || 0);
+    if (idleDelay > 0) {
+      if (attachTimer) return;
+      attachTimer = window.setTimeout(() => {
+        attachTimer = 0;
+        scheduleAttachEditingToolbar();
+      }, idleDelay);
+      return;
+    }
+    if (attachFrame || attachTimer) return;
     attachFrame = window.requestAnimationFrame(() => {
       attachFrame = 0;
       attachEditingToolbar();
@@ -1336,7 +1352,9 @@
 
   window.addEventListener(STATE_EVENT, (event) => {
     try {
-      currentState = JSON.parse(String(event.detail || "null"));
+      currentState = interactionTasks?.parseEditorState
+        ? interactionTasks.parseEditorState(event.detail)
+        : JSON.parse(String(event.detail || "null"));
     } catch (_error) {
       currentState = null;
       return;
@@ -1379,7 +1397,10 @@
     }
   }, { passive: true });
 
-  const observer = new MutationObserver(() => scheduleAttachEditingToolbar());
+  const observer = new MutationObserver(() => {
+    if (editingToolbar?.isConnected) return;
+    scheduleAttachEditingToolbar();
+  });
   observer.observe(document.documentElement, { childList: true, subtree: true });
   scheduleAttachEditingToolbar();
   window.setTimeout(() => {
@@ -1394,6 +1415,7 @@
   window.addEventListener("pagehide", () => {
     observer.disconnect();
     window.clearTimeout(stateUpdateTimer);
+    window.clearTimeout(attachTimer);
     if (attachFrame) window.cancelAnimationFrame(attachFrame);
     if (overflowFrame) window.cancelAnimationFrame(overflowFrame);
     toolbarResizeObserver?.disconnect?.();

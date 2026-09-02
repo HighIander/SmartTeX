@@ -539,8 +539,8 @@
   }
 
   function imageDesiredHeight(image, displayWidth) {
-    const naturalWidth = Number(image?.naturalWidth) || 0;
-    const naturalHeight = Number(image?.naturalHeight) || 0;
+    const naturalWidth = Number(image?.naturalWidth) || Number(image?.getAttribute?.("width")) || 0;
+    const naturalHeight = Number(image?.naturalHeight) || Number(image?.getAttribute?.("height")) || 0;
     if (!(naturalWidth > 0 && naturalHeight > 0)) return displayWidth * 0.62;
     return displayWidth * naturalHeight / naturalWidth;
   }
@@ -1070,12 +1070,26 @@
     const desiredHeight = layoutDesiredHeight(root, desiredWidth);
     const popup = root.closest?.("[data-smarttex-popup-type]");
     const maximumFitScale = popup?.dataset.smarttexUserSized === "true" ? 4 : 1;
-    const scale = Math.min(
+    const popupStyle = popup ? globalThis.getComputedStyle?.(popup) : null;
+    const requestedScale = Math.max(
+      0.05,
+      Number.parseFloat(popupStyle?.getPropertyValue("--smarttex-popup-content-scale")) || 1
+    );
+    const autoFitScale = Math.max(
+      0.75,
+      Math.min(
+        1,
+        Number.parseFloat(popupStyle?.getPropertyValue("--smarttex-popup-auto-fit-scale")) || 1
+      )
+    );
+    const minimumFitScale = requestedScale * autoFitScale;
+    const idealScale = Math.min(
       maximumFitScale,
       availableWidth / desiredWidth,
       availableHeight / desiredHeight
     );
-    const appliedScale = Number.isFinite(scale) && scale > 0 ? scale : 1;
+    const scale = Math.max(minimumFitScale, idealScale);
+    const appliedScale = Number.isFinite(scale) && scale > 0 ? scale : minimumFitScale;
     const viewport = root.closest?.(".smarttex-figure-popup-viewport");
     const figure = root.closest?.(".smarttex-figure-popup");
     const applyLayoutScale = (layoutScale) => {
@@ -1112,8 +1126,21 @@
         viewport.classList.remove("smarttex-figure-popup-scrollable");
       }
       if (figure) {
-        figure.style.width = `${appliedWidth}px`;
-        figure.style.maxWidth = `${appliedWidth}px`;
+        const mainEditorFigure = Boolean(
+          popup?.id === "smarttex-equation-preview" &&
+          popup?.dataset?.previewKind === "figure" &&
+          popup?.dataset?.smarttexUserSized === "true"
+        );
+        if (mainEditorFigure) {
+          // The media viewport is fitted to its aspect ratio, but the figure
+          // container itself must span the popup body so the caption gets the
+          // complete popup width and remains a dedicated bottom row.
+          figure.style.width = "100%";
+          figure.style.maxWidth = "100%";
+        } else {
+          figure.style.width = `${appliedWidth}px`;
+          figure.style.maxWidth = `${appliedWidth}px`;
+        }
         ensurePopupZoom(figure)?.refresh();
       }
     };
@@ -1134,10 +1161,24 @@
       const captionHeight = caption?.getBoundingClientRect?.().height || 0;
       const gap = parseFloat(globalThis.getComputedStyle?.(figure)?.rowGap) || 0;
       const viewportRect = viewport.getBoundingClientRect();
-      const widthBudget = Math.max(20, resizableOutput.clientWidth - horizontalPadding);
+      const popupRect = popup?.getBoundingClientRect?.() || null;
+      const outputRect = resizableOutput.getBoundingClientRect();
+      const availableOutputWidth = popupRect
+        ? Math.max(20, Math.min(
+          resizableOutput.clientWidth,
+          popupRect.right - outputRect.left - 1
+        ))
+        : resizableOutput.clientWidth;
+      const availableOutputHeight = popupRect
+        ? Math.max(20, Math.min(
+          resizableOutput.clientHeight,
+          popupRect.bottom - outputRect.top - 1
+        ))
+        : resizableOutput.clientHeight;
+      const widthBudget = Math.max(20, availableOutputWidth - horizontalPadding);
       const heightBudget = Math.max(
         20,
-        resizableOutput.clientHeight - verticalPadding - captionHeight - gap
+        availableOutputHeight - verticalPadding - captionHeight - gap
       );
       const correction = Math.min(
         1,
@@ -1145,9 +1186,21 @@
         heightBudget / Math.max(1, viewportRect.height)
       );
       if (correction < 0.995) {
-        finalScale *= correction;
+        finalScale = Math.max(minimumFitScale, finalScale * correction);
         applyLayoutScale(finalScale);
       }
+    }
+
+    if (figure) {
+      const caption = figure.querySelector?.(":scope > .smarttex-float-popup-caption");
+      const captionHeight = Math.max(0, caption?.scrollHeight || caption?.getBoundingClientRect?.().height || 0);
+      const gap = parseFloat(globalThis.getComputedStyle?.(figure)?.rowGap) || 0;
+      // Expose the complete natural figure height to the outer popup fitter.
+      // The popup must grow for media + caption first; the media must not be
+      // cropped simply because the current popup happens to be too short.
+      figure.dataset.smarttexRequiredHeightPx = String(
+        Math.max(1, desiredHeight * finalScale + captionHeight + gap)
+      );
     }
   }
 

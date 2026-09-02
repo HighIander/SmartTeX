@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>SmartTeX typing idle browser harness</title>
+  <link rel="stylesheet" href="../content.css">
+</head>
+<body>
+  <div class="file-tree-list"><div role="treeitem" aria-label="main.tex" aria-selected="true"></div></div>
+  <div id="ide-redesign-panel-source-editor">
+    <div class="cm-editor"><div class="cm-scroller"><div class="cm-content" contenteditable="true"></div></div></div>
+  </div>
+  <output id="result" data-result="running">running</output>
+  <script>
+    let editorText = `\\section{Latency}\n${"editor text ".repeat(5000)}`;
+    let cursor = editorText.length;
+    const root = document.querySelector(".cm-editor");
+    const content = document.querySelector(".cm-content");
+    const scroller = document.querySelector(".cm-scroller");
+    function doc() {
+      return {
+        length: editorText.length,
+        lines: 2,
+        toString: () => editorText,
+        lineAt: () => ({ number: 2, from: 18, to: editorText.length }),
+        line: () => ({ from: 18, to: editorText.length })
+      };
+    }
+    const view = {
+      contentDOM: content,
+      dom: root,
+      scrollDOM: scroller,
+      hasFocus: true,
+      state: { doc: doc(), selection: { main: { head: cursor, anchor: cursor, from: cursor, to: cursor } } },
+      dispatch: () => {},
+      coordsAtPos: () => ({ left: 100, right: 102, top: 100, bottom: 118 }),
+      focus: () => { view.hasFocus = true; }
+    };
+    function updateState() {
+      view.state = { doc: doc(), selection: { main: { head: cursor, anchor: cursor, from: cursor, to: cursor } } };
+    }
+    root.cmView = { view };
+  </script>
+  <script src="../interaction-tasks.js"></script>
+  <script src="../latex-context.js"></script>
+  <script src="../page-bridge.js"></script>
+  <script>
+    const result = document.querySelector("#result");
+    let typingStartedAt = 0;
+    let lastInputAt = 0;
+    let stateReceivedAt = 0;
+    let stateValue = "";
+    let earlyState = false;
+    let dispatchDurationMs = 0;
+    let typingBarrierDuringInput = false;
+    let typingLayersHidden = false;
+    let overlayMutations = 0;
+    let overlayMutationsDuringTyping = -1;
+    let pointerStartedAt = 0;
+    let pointerStateAt = 0;
+    const pointerTarget = 24;
+    window.addEventListener("smarttex:editor-state", (event) => {
+      if (!typingStartedAt) return;
+      const state = JSON.parse(event.detail);
+      if (!stateReceivedAt) stateReceivedAt = performance.now();
+      stateValue = state.value;
+      if (pointerStartedAt && state.cursorIndex === pointerTarget && !pointerStateAt) {
+        pointerStateAt = performance.now();
+      }
+    });
+    window.setTimeout(() => {
+      content.focus();
+      const overlayLayers = [...document.querySelectorAll(
+        "#smarttex-source-structure-highlights, #smarttex-source-number-badges"
+      )];
+      const overlayObserver = new MutationObserver((mutations) => {
+        overlayMutations += mutations.length;
+      });
+      for (const layer of overlayLayers) overlayObserver.observe(layer, { childList: true, subtree: true });
+      typingStartedAt = performance.now();
+      const sendKey = () => {
+        const startedAt = performance.now();
+        content.dispatchEvent(new KeyboardEvent("keydown", { key: "z", bubbles: true }));
+        content.dispatchEvent(new InputEvent("beforeinput", { inputType: "insertText", data: "z", bubbles: true }));
+        editorText += "z";
+        cursor = editorText.length;
+        updateState();
+        content.dispatchEvent(new InputEvent("input", { inputType: "insertText", data: "z", bubbles: true }));
+        lastInputAt = performance.now();
+        typingBarrierDuringInput = document.documentElement.dataset.smarttexEditorTyping === "true";
+        typingLayersHidden = overlayLayers.length > 0 && overlayLayers.every((layer) => (
+          getComputedStyle(layer).visibility === "hidden"
+        ));
+        dispatchDurationMs = Math.max(dispatchDurationMs, lastInputAt - startedAt);
+      };
+      sendKey();
+      window.setTimeout(() => {
+        sendKey();
+        const idleRemainingAfterInput = window.SmartTeXInteractionTasks?.keyboardIdleRemaining?.() ?? -1;
+        const activityReason = window.SmartTeXInteractionTasks?.reason?.() || "";
+        window.setTimeout(() => {
+          earlyState = stateReceivedAt > 0;
+          overlayMutationsDuringTyping = overlayMutations;
+        }, 350);
+        window.setTimeout(() => {
+          const stateDelayMs = stateReceivedAt ? stateReceivedAt - lastInputAt : -1;
+          const typingBarrierAfterIdle = document.documentElement.dataset.smarttexEditorTyping === "true";
+          overlayObserver.disconnect();
+          const typingPassed = dispatchDurationMs < 50 && !earlyState && stateDelayMs >= 450 && stateDelayMs < 1000 && stateValue.endsWith("zz") && typingBarrierDuringInput && !typingBarrierAfterIdle && typingLayersHidden && overlayMutationsDuringTyping === 0;
+          content.addEventListener("pointerup", () => {
+            cursor = pointerTarget;
+            updateState();
+          }, { once: true });
+          pointerStartedAt = performance.now();
+          content.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, button: 0 }));
+          content.dispatchEvent(new PointerEvent("pointerup", { bubbles: true, button: 0 }));
+          window.setTimeout(() => {
+            const pointerStateDelayMs = pointerStateAt ? pointerStateAt - pointerStartedAt : -1;
+            const pointerEndedTypingBarrier = window.SmartTeXInteractionTasks?.keyboardIdleRemaining?.() === 0 && document.documentElement.dataset.smarttexEditorTyping !== "true";
+            const passed = typingPassed && pointerStateDelayMs >= 0 && pointerStateDelayMs < 100 && pointerEndedTypingBarrier;
+            const detail = { passed, dispatchDurationMs, stateDelayMs, earlyState, sourceLength: stateValue.length, idleRemainingAfterInput, activityReason, typingBarrierDuringInput, typingBarrierAfterIdle, typingLayersHidden, overlayMutationsDuringTyping, pointerStateDelayMs, pointerEndedTypingBarrier };
+            result.dataset.result = passed ? "passed" : "failed";
+            result.textContent = JSON.stringify(detail);
+          }, 120);
+        }, 850);
+      }, 250);
+    }, 750);
+  </script>
+</body>
+</html>

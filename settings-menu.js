@@ -17,6 +17,8 @@
   const DOCUMENT_OVERRIDES_KEY = "smarttex:document-overrides:v1";
   const POPUP_SIZES_KEY = "smarttex:popup-sizes:v1";
   const POPUP_SCALE_KEY = "smarttex:popup-scale:v1";
+  const POPUP_CAPTION_FONT_SCALE_KEY = "smarttex:popup-caption-font-scale:v1";
+  const POPUP_CAPTION_FONT_BASE_PX = 11;
   const COMMENT_PROFILE_KEY = globalThis.SmartTeXCommentProfile?.KEY || "smarttex:comment-profile:v1";
   const OPEN_SETTINGS_EVENT = globalThis.SmartTeXCommentProfile?.OPEN_SETTINGS_EVENT || "smarttex:open-settings-menu";
   const RUNTIME_SETTINGS_EVENT = "smarttex:runtime-settings";
@@ -123,6 +125,8 @@
   }
 
   const documentKey = stableDocumentKey();
+  let popupCaptionFontScale = readPopupCaptionFontScale();
+  applyPopupCaptionFontScale(popupCaptionFontScale, { persist: false });
 
   function validColor(value, fallback) {
     return /^#[0-9a-f]{6}$/i.test(String(value || ""))
@@ -171,6 +175,40 @@
       window.dispatchEvent(new CustomEvent("smarttex:set-popup-relative-size", { detail: normalized }));
     }
     return normalized;
+  }
+
+  function clampPopupCaptionFontScale(value) {
+    return Math.max(0.5, Math.min(2, Number(value) || 1));
+  }
+
+  function readPopupCaptionFontScale() {
+    try {
+      return clampPopupCaptionFontScale(localStorage.getItem(POPUP_CAPTION_FONT_SCALE_KEY));
+    } catch (_error) {
+      return 1;
+    }
+  }
+
+  function applyPopupCaptionFontScale(value, { persist = true } = {}) {
+    const scale = clampPopupCaptionFontScale(value);
+    if (persist) {
+      try {
+        localStorage.setItem(POPUP_CAPTION_FONT_SCALE_KEY, String(scale));
+      } catch (_error) {
+        // The current page can still use the slider even if persistence is blocked.
+      }
+    }
+    // Use one root variable for figure and table captions so cached and freshly
+    // rendered popup DOM share identical typography. The slider is relative to
+    // the compact 11 px default rather than mutating cached markup itself.
+    document.documentElement.style.setProperty(
+      "--smarttex-popup-caption-font-size",
+      `${POPUP_CAPTION_FONT_BASE_PX * scale}px`
+    );
+    window.dispatchEvent(new CustomEvent("smarttex:set-popup-caption-font-scale", {
+      detail: { scale, pixels: POPUP_CAPTION_FONT_BASE_PX * scale }
+    }));
+    return scale;
   }
 
   function normalizedPresets(stored = {}) {
@@ -485,6 +523,20 @@
       separateControls[type] = { input, value };
     }
 
+    const captionScaleRow = document.createElement("label");
+    captionScaleRow.className = "smarttex-settings-popup-caption-scale";
+    const captionScaleLabel = document.createElement("span");
+    captionScaleLabel.textContent = "Caption font";
+    const captionScale = document.createElement("input");
+    captionScale.type = "range";
+    captionScale.min = "50";
+    captionScale.max = "200";
+    captionScale.step = "5";
+    captionScale.setAttribute("aria-label", "Figure and table popup caption font size");
+    const captionScaleValue = document.createElement("span");
+    captionScaleValue.className = "smarttex-settings-popup-scale-value";
+    captionScaleRow.append(captionScaleLabel, captionScale, captionScaleValue);
+
     const updatePopupScaleControls = () => {
       const separate = popupScaleSettings.mode === "separate";
       globalScaleWrap.hidden = separate;
@@ -498,6 +550,9 @@
         separateControls[type].input.value = String(percent);
         separateControls[type].value.textContent = `${percent}%`;
       }
+      const captionPercent = Math.round(popupCaptionFontScale * 100);
+      captionScale.value = String(captionPercent);
+      captionScaleValue.textContent = `${captionPercent}%`;
     };
 
     const commitPopupScale = (next) => {
@@ -507,6 +562,10 @@
 
     globalScale.addEventListener("input", () => {
       commitPopupScale({ global: Number(globalScale.value) / 100 });
+    });
+    captionScale.addEventListener("input", () => {
+      popupCaptionFontScale = applyPopupCaptionFontScale(Number(captionScale.value) / 100);
+      captionScaleValue.textContent = `${Math.round(popupCaptionFontScale * 100)}%`;
     });
     for (const type of ["image", "equation", "table"]) {
       separateControls[type].input.addEventListener("input", () => {
@@ -542,7 +601,7 @@
     });
 
     popupControls.append(resetPopupSizes, globalScaleWrap, detailToggle);
-    popupSection.append(popupHeading, popupControls, separateScales);
+    popupSection.append(popupHeading, popupControls, separateScales, captionScaleRow);
     updatePopupScaleControls();
     scrollBody.appendChild(popupSection);
 
@@ -807,7 +866,10 @@
     dispatchEffectiveSettings();
   });
 
-  const buttonObserver = new MutationObserver(() => attachButton());
+  const buttonObserver = new MutationObserver(() => {
+    if (optionsButton?.isConnected) return;
+    attachButton();
+  });
   buttonObserver.observe(document.documentElement, { childList: true, subtree: true });
   attachButton();
   loadSettings().catch((error) => {

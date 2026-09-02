@@ -1048,7 +1048,9 @@
 
     window.addEventListener(STATE_EVENT, (event) => {
       try {
-        currentState = JSON.parse(String(event.detail || "null"));
+        currentState = interactionTasks?.parseEditorState
+          ? interactionTasks.parseEditorState(event.detail)
+          : JSON.parse(String(event.detail || "null"));
       } catch (_error) {
         currentContext = null;
         setAutocompleteContextActive(false);
@@ -1151,7 +1153,6 @@
       lastTextInputAt = Date.now();
       scrollSuppressed = false;
     };
-    document.addEventListener("beforeinput", noteTextInput, true);
     document.addEventListener("input", noteTextInput, true);
 
     document.addEventListener("mousedown", (event) => {

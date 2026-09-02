@@ -76,6 +76,7 @@
   const tableRenderer = globalThis.SmartTeXTableRenderer;
   const tableEditor = globalThis.SmartTeXTableEditor;
   const katex = globalThis.katex;
+  const interactionTasks = globalThis.SmartTeXInteractionTasks;
 
 
   let currentState = null;
@@ -102,6 +103,7 @@
   let referencePopupTrigger = "hover";
   let preview = null;
   let observer = null;
+  let observerRefreshTimer = 0;
   let fastCursorFrame = null;
   let fastStructureGeneration = 0;
   let pendingFastStructureSource = null;
@@ -128,6 +130,18 @@
   let referencePopup = null;
   let referencePopupTimer = null;
   let referencePopupGeneration = 0;
+
+  interactionTasks?.subscribe?.(() => {
+    window.clearTimeout(renderTimer);
+    renderTimer = null;
+    renderGeneration += 1;
+    fastStructureGeneration += 1;
+    pendingFastStructureSource = null;
+    if (fastCursorFrame !== null) cancelAnimationFrame(fastCursorFrame);
+    fastCursorFrame = null;
+    window.clearTimeout(observerRefreshTimer);
+    observerRefreshTimer = 0;
+  });
   let nestedReferencePopup = null;
   let nestedReferencePopupTimer = null;
   let nestedReferencePopupGeneration = 0;
@@ -7431,7 +7445,9 @@
     const previousValue = currentState?.value;
     const previousFileName = currentState?.fileName;
     try {
-      currentState = JSON.parse(String(event.detail || "null"));
+      currentState = interactionTasks?.parseEditorState
+        ? interactionTasks.parseEditorState(event.detail)
+        : JSON.parse(String(event.detail || "null"));
     } catch (_error) {
       currentState = null;
       return;
@@ -7609,14 +7625,16 @@
   });
 
   loadCitationRecords();
-  observer = new MutationObserver((mutations) => {
-    if (mutations.some((mutation) => mutation.type === "childList")) {
+  const scheduleIntegrationRefresh = () => {
+    if (observerRefreshTimer) return;
+    observerRefreshTimer = window.setTimeout(() => {
+      observerRefreshTimer = 0;
       attachPdfIntegration();
-    } else {
       attachEditingToolbar();
-    }
-    updateActivitySpinner();
-  });
+      updateActivitySpinner();
+    }, Math.max(0, Number(interactionTasks?.keyboardIdleRemaining?.()) || 0));
+  };
+  observer = new MutationObserver(scheduleIntegrationRefresh);
   observer.observe(document.documentElement, {
     childList: true,
     subtree: true,
@@ -7639,6 +7657,7 @@
     zoomResizeObserver?.disconnect();
     window.clearTimeout(renderTimer);
     window.clearTimeout(previewSelectionSyncTimer);
+    window.clearTimeout(observerRefreshTimer);
     clearPreviewSourceHighlight();
     if (fastCursorFrame !== null) cancelAnimationFrame(fastCursorFrame);
     settingsMenu?.remove();

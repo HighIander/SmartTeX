@@ -750,6 +750,8 @@
     const source = String(state.value || "");
     const fileName = String(state.fileName || "");
     if (source === lastAnalyzedSource && fileName === lastAnalyzedFileName) return;
+    if (interactionTasks?.canRunLongTask &&
+        !interactionTasks.canRunLongTask(state, source.length)) return;
     let result;
     try {
       result = interactionTasks?.runSync
@@ -757,7 +759,7 @@
         : sourceAnalysis(state);
     } catch (error) {
       if (interactionTasks?.isAbortError?.(error)) {
-        scheduleAnalysis({ delay: 180 });
+        scheduleAnalysis({ delay: 500 });
         return;
       }
       throw error;
@@ -777,7 +779,11 @@
 
   function scheduleAnalysis({ immediate = false, delay = null } = {}) {
     window.clearTimeout(analysisTimer);
-    const wait = delay === null ? (immediate ? 0 : 500) : Math.max(0, Number(delay) || 0);
+    const requestedWait = delay === null ? (immediate ? 0 : 500) : Math.max(0, Number(delay) || 0);
+    const wait = Math.max(
+      requestedWait,
+      Number(interactionTasks?.keyboardIdleRemaining?.()) || 0
+    );
     analysisTimer = window.setTimeout(runScheduledAnalysis, wait);
   }
 
@@ -794,10 +800,7 @@
     previewRenderFrame = 0;
     if (placementFrame) window.cancelAnimationFrame(placementFrame);
     placementFrame = 0;
-    if (currentState && (
-      String(currentState.value || "") !== String(lastAnalyzedSource || "") ||
-      String(currentState.fileName || "") !== String(lastAnalyzedFileName || "")
-    )) scheduleAnalysis({ delay: 180 });
+    // The next post-idle state event schedules analysis when the source changed.
   });
 
   window.addEventListener(RESPONSE_EVENT, (event) => {
@@ -2113,7 +2116,9 @@
   window.addEventListener(STATE_EVENT, (event) => {
     let state;
     try {
-      state = JSON.parse(String(event.detail || "null"));
+      state = interactionTasks?.parseEditorState
+        ? interactionTasks.parseEditorState(event.detail)
+        : JSON.parse(String(event.detail || "null"));
     } catch (_error) {
       return;
     }

@@ -36,6 +36,13 @@
     "minted"
   ];
   const CARET_MACRO = "\\SmartTeXCaret{}";
+  const KATEX_COMPATIBLE_MATH_MACROS = Object.freeze({
+    // `upgreek` is common in plasma-physics documents but KaTeX does not
+    // provide its upright-Greek commands. Keep the physical tensor notation
+    // intact in every preview, including `\\bm{\\upsigma}`.
+    "\\upsigma": "\\mathrm{\\sigma}",
+    "\\upvarepsilon": "\\mathrm{\\varepsilon}"
+  });
   const MASK_CHARACTER = "\u0000";
   function taskCheckpoint(iteration = 0, interval = 256) {
     global.SmartTeXInteractionTasks?.checkpoint?.(iteration, interval);
@@ -1032,6 +1039,7 @@
       .filter((record) => record.optionalDefault !== null)
       .sort((left, right) => right.name.length - left.name.length);
     const macros = {
+      ...KATEX_COMPATIBLE_MATH_MACROS,
       // LaTeX's \ensuremath is a mode guard. SmartTeX only sends these
       // fragments to KaTeX's math renderer, so its argument is the complete
       // compatible expansion.
@@ -1061,7 +1069,7 @@
       : [];
     return {
       body: expandOptionalCommands(bodyValue, optionalRecords),
-      macros: prepared.macros || { "\\ensuremath": "#1" },
+      macros: prepared.macros || { ...KATEX_COMPATIBLE_MATH_MACROS, "\\ensuremath": "#1" },
       count: Number(prepared.count) || 0
     };
   }
@@ -2062,6 +2070,7 @@
     findFigureContext,
     extractNewCommandDefinitions,
     prepareDocumentCommands,
+    katexCompatibleMathMacros: () => ({ ...KATEX_COMPATIBLE_MATH_MACROS }),
     prepareDocumentCommandContext,
     applyPreparedDocumentCommands,
     analyzeEquations,

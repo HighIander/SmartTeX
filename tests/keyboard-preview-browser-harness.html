@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>SmartTeX keyboard preview browser harness</title><style>.cm-scroller { height:250px; overflow:auto } .cm-content { height:1000px }</style>
+  <link rel="stylesheet" href="../content.css">
+</head>
+<body>
+  <div class="file-tree-list"><div role="treeitem" aria-label="main.tex" aria-selected="true"></div></div>
+  <div id="ide-redesign-panel-source-editor">
+    <div class="cm-editor"><div class="cm-scroller"><div class="cm-content" contenteditable="true"></div></div></div>
+  </div>
+  <output id="result" data-result="running">running</output>
+  <script>
+    let editorText = `\\begin{equation}\nx=y\n\\end{equation}\n${"editor text ".repeat(5000)}`;
+    let cursor = editorText.length;
+    const root = document.querySelector(".cm-editor");
+    const content = document.querySelector(".cm-content");
+    const scroller = document.querySelector(".cm-scroller");
+    function doc() {
+      return {
+        length: editorText.length,
+        lines: 2,
+        toString: () => editorText,
+        lineAt: () => ({ number: 2, from: 18, to: editorText.length }),
+        line: () => ({ from: 18, to: editorText.length })
+      };
+    }
+    const view = {
+      contentDOM: content,
+      dom: root,
+      scrollDOM: scroller,
+      hasFocus: true,
+      state: { doc: doc(), selection: { main: { head: cursor, anchor: cursor, from: cursor, to: cursor } } },
+      dispatch: () => {},
+      coordsAtPos: () => ({ left: 100, right: 102, top: 100, bottom: 118 }),
+      focus: () => { view.hasFocus = true; }
+    };
+    function updateState() {
+      view.state = { doc: doc(), selection: { main: { head: cursor, anchor: cursor, from: cursor, to: cursor } } };
+    }
+    root.cmView = { view };
+  </script>
+  <script src="../interaction-tasks.js"></script>
+  <script src="../latex-context.js"></script>
+  <script src="../page-bridge.js"></script>
+  <script src="../vendor/katex/katex.min.js"></script>
+  <script src="../table-renderer.js"></script>
+  <script>globalThis.SmartTeXPopupGate = { isReady: () => true };</script>
+  <script src="../popup-gate.js"></script>
+  <script src="../content.js"></script>
+  <script>
+    const result = document.querySelector('#result');
+    const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
+    const checks = [];
+    const check = (name, passed) => { checks.push({ name, passed }); if (!passed) throw new Error(name); };
+    let pendingUntil = 0;
+    let idleEvents = 0;
+    window.addEventListener('smarttex:keyboard-idle', () => { idleEvents += 1; });
+    // Model a host key transaction with more input queued after keyup. Preview
+    // work must wait for or recover after this interval without a mouse event.
+    Object.defineProperty(navigator, 'scheduling', { configurable: true, value: {
+      isInputPending: () => performance.now() < pendingUntil
+    } });
+    window.addEventListener('smarttex:editor-state', () => {
+      if (performance.now() < pendingUntil) {
+        window.SmartTeXInteractionTasks.cancel('pending-input');
+      }
+    });
+    const waitFor = async (predicate, name) => {
+      const until = performance.now() + 4000;
+      while (!predicate() && performance.now() < until) await pause(25);
+      check(name, Boolean(predicate()));
+    };
+    const navigate = target => {
+      pendingUntil = performance.now() + 80;
+      content.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowLeft', bubbles: true }));
+      cursor = target;
+      updateState();
+      content.dispatchEvent(new KeyboardEvent('keyup', { key: 'ArrowLeft', bubbles: true }));
+    };
+    const clickNavigate = target => {
+      content.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, button: 0 }));
+      cursor = target;
+      updateState();
+      content.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, button: 0 }));
+    };
+    (async () => {
+      content.focus();
+      await pause(1000);
+      const layer = document.querySelector('#smarttex-source-structure-highlights');
+      const popup = document.querySelector('#smarttex-equation-preview');
+      check('preview initially closed outside equation', popup && popup.hidden);
+      navigate(editorText.indexOf('x=y') + 1);
+      check('navigation leaves highlights visible', getComputedStyle(layer).visibility === 'visible');
+      await waitFor(() => !popup.hidden && getComputedStyle(popup).visibility === 'visible' && popup.querySelector('.katex'), 'keyboard entry opens rendered equation preview');
+      check('keyboard entry never leaves an empty popup', Boolean(popup.querySelector('.katex')));
+      await waitFor(() => idleEvents > 0, 'keyboard idle transaction delivered');
+      navigate(cursor + 1);
+      await pause(750);
+      check('moving inside equation keeps preview open', !popup.hidden);
+      check('moving inside equation keeps highlights visible', getComputedStyle(layer).visibility === 'visible');
+      navigate(editorText.length - 1);
+      check('keyboard exit closes preview immediately', popup.hidden);
+      check('closed preview discards previous rendered content', (
+        popup.querySelector('.smarttex-equation-output')?.childElementCount === 0 &&
+        popup.querySelector('.smarttex-preview-status')?.textContent === '' &&
+        popup.querySelector('.smarttex-preview-meta')?.textContent === ''
+      ));
+      navigate(editorText.indexOf('x=y') + 1);
+      await waitFor(() => !popup.hidden && getComputedStyle(popup).visibility === 'visible' && popup.querySelector('.katex'), 'keyboard reentry opens nonempty preview without mouse');
+      content.dispatchEvent(new KeyboardEvent('keydown', { key: 'a', bubbles: true }));
+      content.dispatchEvent(new InputEvent('beforeinput', { inputType: 'insertText', data: 'a', bubbles: true }));
+      navigate(editorText.length - 1);
+      check('keyboard exit still closes during typing', popup.hidden);
+      navigate(editorText.indexOf('x=y') + 1);
+      await waitFor(() => !popup.hidden && popup.querySelector('.katex'), 'cached keyboard entry opens during typing');
+      const clickExitStarted = performance.now();
+      clickNavigate(editorText.length - 1);
+      await waitFor(() => popup.hidden, 'click exit closes preview');
+      check('click exit bypasses typing idle delay', performance.now() - clickExitStarted < 150);
+      const clickEntryStarted = performance.now();
+      clickNavigate(editorText.indexOf('x=y') + 1);
+      await waitFor(() => !popup.hidden && popup.querySelector('.katex'), 'click entry opens nonempty cached preview');
+      check('click entry bypasses typing idle delay', performance.now() - clickEntryStarted < 150);
+      document.documentElement.dataset.keyboardPreviewTest = 'passed';
+      result.textContent = JSON.stringify({ passed: true, checks });
+    })().catch(error => {
+      document.documentElement.dataset.keyboardPreviewTest = 'failed';
+      result.textContent = JSON.stringify({ passed: false, error: error.message, checks });
+    });
+  </script>
+</body>
+</html>
+
+

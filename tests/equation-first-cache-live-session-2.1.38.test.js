@@ -9,16 +9,20 @@ const root = path.resolve(__dirname, "..");
 const content = fs.readFileSync(path.join(root, "content.js"), "utf8");
 const manifest = fs.readFileSync(path.join(root, "manifest.json"), "utf8");
 
-test("background-warmed equation key is identical to first-open environment identity", () => {
+test("background-warmed equation key keeps stable document and environment identity", () => {
+  const identityBlock = content.match(/function previewEnvironmentIdentity\(state, context\) \{[\s\S]*?\n  \}/)?.[0] || "";
   const keyBlock = content.match(/function previewBaseCacheKey\(state, context\) \{[\s\S]*?\n  \}/)?.[0] || "";
-  assert.match(keyBlock, /previewSourceSignature\(state\)/);
-  assert.match(keyBlock, /context\?\.openStart/);
-  assert.doesNotMatch(keyBlock, /fastPreviewHash\(context\?\.source/);
+  assert.match(identityBlock, /previewDocumentCacheIdentity\(state\)/);
+  assert.match(identityBlock, /previewEnvironmentOrdinal\(state, context\)/);
+  assert.match(keyBlock, /previewEnvironmentIdentity\(state, context\)/);
+  assert.match(keyBlock, /fastPreviewHash\(String\(context\?\.source/);
+  assert.doesNotMatch(keyBlock, /previewSourceSignature\(state\)|context\?\.openStart/);
 });
 
 test("any warm equation cache is authoritative for the opening frame", () => {
-  assert.match(content, /const warmPreview = await tryFastWarmPreview[\s\S]*if \(warmPreview\) \{[\s\S]*return;/);
+  assert.match(content, /const warmPreview = job\?\.skipWarm \? null : await tryFastWarmPreview[\s\S]*if \(warmPreview\) \{[\s\S]*return;/);
   assert.match(content, /do not immediately continue[\s\S]*cold cursor-specific KaTeX render/);
+  assert.match(content, /needsTransientEquationState[\s\S]*session\.refreshRequested = Boolean\(warm\.stale \|\| needsTransientEquationState\)/);
 });
 
 test("equation typing updates the existing popup without generic scheduleRender", () => {

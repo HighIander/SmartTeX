@@ -157,20 +157,16 @@
    *   inter-item gaps, and the full caption. A figure popup may grow vertically
    *   to the usable viewport before the 75%-then-scroll fallback is considered;
    *   the image must not be cropped merely to reserve caption space.
-   * - Editing an already-open equation or figure/table caption updates that same
-   *   popup live. The popup stays open and stationary and grows/refits when the
-   *   new rendered content requires more space. Equation edits retain the last
-   *   valid rendering through transiently incomplete TeX and replace/refit it as
-   *   soon as the next valid render exists. Equation typing is an in-place
-   *   edit session: secondary cursor/focus/layout events are absorbed while the
-   *   caret remains in the equation, so the generic trigger cannot close/reopen
-   *   the popup after the first live update. The rendered equation caret is also
-   *   refreshed in-place on arrow-key movement. When the editor caret is inside
-   *   a figure/table caption, the same caret is rendered inside the popup caption
-   *   and follows both arrow-key movement and typing. Caption text gets a lightweight
-   *   near-live update in the same mounted figure/table popup; it must not fall
-   *   through into a delayed full-popup render. The independent idle cache
-   *   warmer performs the expensive settled-source parse/cache refresh later.
+   * - A text keypress cancels every fresh parser/render/layout task. No complete
+   *   editor snapshot or popup refresh may run before 500 ms of keyboard idle.
+   *   The sole exception is revealing already-rendered cached popup markup after
+   *   cursor entry; that cache-only transaction may finish across later keys.
+   *   After idle, an already-open equation or figure/table caption updates the
+   *   same mounted popup. Arrow-key caret movement remains immediate and does not
+   *   wake the expensive general editor-state path.
+   * - During an actual editor scroll, all SmartTeX overlays are hidden by CSS and
+   *   no parsing, rendering, positioning, or highlight reconstruction runs. Work
+   *   resumes only after 500 ms without another scroll event.
    * - More generally, an environment popup is owned by that environment until
    *   the caret actually leaves it (or the user explicitly closes it). Generic
    *   focus/scroll/layout cleanup and stale queued renders must never tear down
@@ -186,12 +182,11 @@
    *   cache diagnostic dots in source lines and popup headers have been removed.
    *   Warming starts from the first available document state—even before
    *   popup interaction is enabled—and progressively covers all display-preview
-   *   environments, prioritizing those nearest the caret. A full-document source
-   *   signature already invalidates entries after any edit, so environment cache
-   *   identity is deliberately just kind + opening source position within that
-   *   signature; redundant context-body hashes must not make a background-warmed
-   *   equation miss on its first opening. Unchanged figure/table cache identity is
-   *   independent of caret moves.
+   *   environments, prioritizing those nearest the caret. Stable cache identity
+   *   uses document + logical kind + environment ordinal + environment-body hash;
+   *   a separate source signature marks stale entries without making unrelated
+   *   prefix edits destroy their identity. Unchanged figure/table cache identity
+   *   is independent of caret moves.
    * - Cached DOM is cloned into a fresh display instance; transient selection,
    *   scroll, zoom, drag, and handler state is never reused as live popup state.
    *   Figure cache entries additionally retain references to their already-decoded
@@ -423,6 +418,31 @@
   const previewMeta = preview.querySelector(".smarttex-preview-meta");
   const previewLoadingIndicator = preview.querySelector(".smarttex-preview-loading-indicator");
   const closeButton = preview.querySelector(".smarttex-preview-close");
+
+  function clearPreviewDisplayedContent() {
+    output.replaceChildren();
+    status.textContent = "";
+    status.removeAttribute("title");
+    status.hidden = true;
+    previewTitle.textContent = "";
+    previewMeta.textContent = "";
+    previewMeta.hidden = true;
+  }
+
+  function resetPreviewOpening() {
+    // Retire the old frame before any asynchronous preparation of its successor.
+    preview.hidden = true;
+    preview.classList.remove("smarttex-preview-visible", "smarttex-preview-staging", "smarttex-preview-stale");
+    delete preview.dataset.smarttexStaging;
+    clearPreviewDisplayedContent();
+    lastSuccessfulMarkup = "";
+    activeFloatCaptionRenderInfo = null;
+    caretPlacementState = null;
+    previewPositioned = false;
+    verticalScrollRepositionPending = false;
+    setPopupOpenedFromCache(false);
+  }
+
   const graphicAutocompletePopupUI = globalThis.SmartTeXPopupUI?.enhance?.(
     graphicAutocompletePreview,
     { type: "image", onClose: dismissGraphicAutocompleteClickPreview }
@@ -707,6 +727,8 @@
   let environmentHoverGeneration = 0;
   let renderTimer = null;
   let renderGeneration = 0;
+  let environmentPreviewSession = null;
+  let lastGeneralEditorState = null;
   let scheduledPreviewHint = null;
   let activeContextId = "";
   const dismissedPreviewContexts = new Map();
@@ -715,6 +737,7 @@
   let captionPreviewLock = null;
   let liveCaptionUpdateTimer = null;
   let liveEquationUpdateTimer = null;
+  let liveEquationRenderedBaseKey = "";
   // While an equation is being edited, keep one explicit edit session alive
   // until the caret leaves that equation. Generic editor state/focus/layout
   // notifications must not tear down and recreate the popup between keystrokes.
@@ -743,6 +766,9 @@
   let autocompleteReferenceOwnerRect = null;
   let autocompleteReferenceCommandStart = null;
   let autocompleteReferenceTargetKey = "";
+  let autocompleteReferencePreviewGeneration = 0;
+  let referenceTargetCacheSource = null;
+  let referenceTargetCache = new Map();
   const nestedCaptionReferencePopupStates = [];
   let editorReferenceHoverTimer = null;
   let editorReferenceHoverGeneration = 0;
@@ -784,10 +810,26 @@
   const pendingRequests = new Map();
   let popupsSuppressedAfterEditorScroll = false;
 
+  function cachedReferenceTarget(sourceValue, labelValue) {
+    const source = String(sourceValue || "");
+    const label = String(labelValue || "").trim();
+    if (source !== referenceTargetCacheSource) {
+      referenceTargetCacheSource = source;
+      referenceTargetCache = new Map();
+    }
+    if (!label) return null;
+    if (!referenceTargetCache.has(label)) {
+      referenceTargetCache.set(label, contextTools.referenceTarget?.(source, label) || null);
+    }
+    return referenceTargetCache.get(label) || null;
+  }
+
   interactionTasks?.subscribe?.(() => {
-    if (renderTimer !== null) window.clearTimeout(renderTimer);
-    renderTimer = null;
-    renderGeneration += 1;
+    if (!environmentPreviewSession) {
+      if (renderTimer !== null) window.clearTimeout(renderTimer);
+      renderTimer = null;
+      renderGeneration += 1;
+    }
     if (environmentHoverTimer !== null) window.clearTimeout(environmentHoverTimer);
     environmentHoverTimer = null;
     environmentHoverGeneration += 1;
@@ -801,12 +843,17 @@
       graphicAutocompleteUpdateFrame = null;
     }
     graphicAutocompleteGeneration += 1;
-    previewPositionGeneration += 1;
+    if (!environmentPreviewSession) previewPositionGeneration += 1;
     if (previewCacheWarmTimer !== null) window.clearTimeout(previewCacheWarmTimer);
     previewCacheWarmTimer = null;
     previewCacheWarmGeneration += 1;
     if (numberedOutlineUpdateTimer !== null) window.clearTimeout(numberedOutlineUpdateTimer);
     numberedOutlineUpdateTimer = null;
+    if (environmentPreviewSession?.timer !== null) {
+      window.clearTimeout(environmentPreviewSession.timer);
+      environmentPreviewSession.timer = null;
+      scheduleEnvironmentPreviewSession(environmentPreviewSession);
+    }
   });
 
   preview.addEventListener("pointerenter", () => {
@@ -886,6 +933,13 @@
   const CAPTION_RENDER_CACHE_LIMIT = 160;
   const previewRenderCache = new Map();
   const previewBaseRenderCache = new Map();
+  const previousEnvironmentRenderCache = new Map();
+  let backgroundPreviewContextIndex = {
+    fileName: "",
+    documentId: "",
+    source: null,
+    entries: []
+  };
   const structureHoverRenderCache = new Map();
   const captionRenderCache = new Map();
   let previewCacheWarmTimer = null;
@@ -964,16 +1018,24 @@
     // decoded-image cache stays hot until eviction. The visible popup still gets
     // fresh DOM markup, so no live scroll/drag/event state is shared.
     const mediaKeepalive = extras?.mediaKeepalive ?? previous?.mediaKeepalive ?? null;
-    return lruCacheSet(
+    const entry = lruCacheSet(
       cache,
       key,
       {
         markup: String(markup || ""),
-        metrics: metrics || null,
+        metrics: metrics || previous?.metrics || null,
+        sourceSignature: String(extras?.sourceSignature || previous?.sourceSignature || ""),
         ...(mediaKeepalive ? { mediaKeepalive } : {})
       },
       PREVIEW_RENDER_CACHE_LIMIT
     );
+    if (cache === previewBaseRenderCache) {
+      // Retain the last completed version across source-signature changes. It
+      // is only an opening frame; a fresh render always follows a stale hit.
+      const identity = String(key).split("::").slice(0, 3).join("::");
+      lruCacheSet(previousEnvironmentRenderCache, identity, { entry, sourceKey: key }, PREVIEW_RENDER_CACHE_LIMIT);
+    }
+    return entry;
   }
 
   function canonicalPreviewBaseMarkup(markup) {
@@ -1038,17 +1100,36 @@
     return previewSourceSignatureCacheValue;
   }
 
-  function previewBaseCacheKey(state, context) {
-    // previewSourceSignature() hashes the complete LaTeX source. Therefore a
-    // second hash of context.source is redundant and, more importantly, can
-    // differ between the proactive equation analyzer and the cursor-local
-    // context finder even though they refer to the same unchanged environment.
-    // Use the stable environment identity inside the document signature so a
-    // background-warmed equation is guaranteed to hit on its very first open.
+  function previewDocumentCacheIdentity(state) {
+    return fastPreviewHash(String(state?.documentId || state?.fileName || "document"));
+  }
+
+  function previewEnvironmentOrdinal(state, context) {
+    const source = String(state?.value || "");
+    const environmentSource = String(context?.source || "");
+    const openStart = Math.max(0, Number(context?.openStart ?? context?.sourceIndex ?? 0) || 0);
+    if (!environmentSource) return 0;
+    let ordinal = 0;
+    let index = source.indexOf(environmentSource);
+    while (index >= 0 && index < openStart) {
+      ordinal += 1;
+      index = source.indexOf(environmentSource, index + Math.max(1, environmentSource.length));
+    }
+    return ordinal;
+  }
+
+  function previewEnvironmentIdentity(state, context) {
     return [
-      previewSourceSignature(state),
+      previewDocumentCacheIdentity(state),
       previewElementKind(context),
-      Number(context?.openStart ?? context?.sourceIndex ?? 0)
+      previewEnvironmentOrdinal(state, context)
+    ].join("::");
+  }
+
+  function previewBaseCacheKey(state, context) {
+    return [
+      previewEnvironmentIdentity(state, context),
+      fastPreviewHash(String(context?.source || ""))
     ].join("::");
   }
 
@@ -1240,7 +1321,7 @@
       };
     }
     if (entry?.label) {
-      const labelled = contextTools.referenceTarget?.(source, entry.label);
+      const labelled = cachedReferenceTarget(source, entry.label);
       if (labelled) return labelled;
     }
     if (entry?.type === "equation") {
@@ -1525,6 +1606,7 @@
     structureHoverPreviewAnchor = anchor;
     const popup = ensureStructureHoverPreview();
     popup.hidden = true;
+    popup.replaceChildren();
     structureHoverPreviewTimer = window.setTimeout(async () => {
       structureHoverPreviewTimer = null;
       try {
@@ -2395,20 +2477,7 @@
       previewLoadingGlobalGeneration = null;
     }
     if (openingNewContext) {
-      output.replaceChildren();
-      previewMeta.textContent = "";
-      previewMeta.hidden = true;
-      status.textContent = "";
-      status.hidden = true;
-      preview.classList.remove(
-        "smarttex-preview-stale",
-        "smarttex-preview-visible",
-        "smarttex-preview-staging"
-      );
-      delete preview.dataset.smarttexStaging;
-      caretPlacementState = null;
-      lastSuccessfulMarkup = "";
-      previewPositioned = false;
+      resetPreviewOpening();
       // The header diagnostic describes how this opening was populated. Reset it
       // before a new environment opens; revealCachedPreviewMarkup() turns it on
       // only when cached content actually supplies the opening frame.
@@ -2536,6 +2605,8 @@
   }
 
   function hidePreview({ clearDismissal = true, force = false } = {}) {
+    if (force) cancelEnvironmentPreviewSession();
+    else if (environmentPreviewSession) return false;
     // Automatic lifecycle cleanup must never close a popup while the caret is
     // still inside the environment that owns it. CollabTeX emits independent
     // focus, scroll, hover and layout notifications around every keypress; any
@@ -2571,6 +2642,7 @@
     }
     activeFloatCaptionRenderInfo = null;
     liveEquationEditSession = null;
+    liveEquationRenderedBaseKey = "";
     activeEnvironmentInputTransaction = null;
     hidePreviewLoading();
     if (renderTimer !== null) {
@@ -2579,6 +2651,7 @@
     }
     renderGeneration += 1;
     preview.hidden = true;
+    clearPreviewDisplayedContent();
     preview.classList.remove(
       "smarttex-preview-visible",
       "smarttex-preview-stale",
@@ -2923,6 +2996,7 @@
   }
 
   function cancelPendingEnvironmentPreviewRender() {
+    if (environmentPreviewSession) return;
     // Live editing/caret movement inside an already mounted environment preview
     // must never race a previously queued generic render transaction. A stale
     // scheduleRender() job can otherwise finish after the in-place update and
@@ -2969,7 +3043,7 @@
     // task and immediately throws "SmartTeX task aborted: keyboard". Give every
     // live equation refresh its own current-generation task so cancellation
     // kills stale work but never the update caused by the same keypress.
-    const liveTaskToken = interactionTasks?.begin?.("popup-live-equation") || null;
+    const liveTaskToken = interactionTasks?.begin?.("popup-live-equation", environmentPreviewTaskOptions()) || null;
     try {
     if (
       !state || !context || previewElementKind(context) !== "equation" || preview.hidden ||
@@ -2981,7 +3055,10 @@
     const nextContextId = previewContextId(state, context);
     if (expectedContextId && nextContextId !== expectedContextId) return false;
 
-    const numbering = contextTools.equationPreviewNumbering?.(state.value, context) || null;
+    const renderedBaseKey = previewBaseCacheKey(state, context);
+    const sourceChanged = renderedBaseKey !== liveEquationRenderedBaseKey;
+    const equationRenderData = equationRenderDataForState(state, context);
+    const numbering = equationRenderData.numbering;
     const hasSelection = Number(state.selectionFrom) !== Number(state.selectionTo);
     if (!hasSelection) {
       // The live path must update the visual caret as well as the equation text.
@@ -2999,11 +3076,10 @@
     const body = contextTools.previewBody(context, commandSide, numbering, !hasSelection);
     let prepared;
     try {
-      prepared = contextTools.prepareDocumentCommands(
-        state.value,
-        Number(context.openStart) || 0,
-        body
-      );
+      prepared = equationRenderData.commandContext &&
+        typeof contextTools.applyPreparedDocumentCommands === "function"
+        ? contextTools.applyPreparedDocumentCommands(equationRenderData.commandContext, body)
+        : contextTools.prepareDocumentCommands(state.value, Number(context.openStart) || 0, body);
     } catch (_error) {
       // Keep the last valid popup rendering while document-level macros are in
       // an intermediate state; the next keystroke will retry this transaction.
@@ -3052,11 +3128,10 @@
       // generic close/open renderer. The next cursor/key event retries the caret.
       try {
         const fallbackBody = contextTools.previewBody(context, null, numbering, false);
-        const fallbackPrepared = contextTools.prepareDocumentCommands(
-          state.value,
-          Number(context.openStart) || 0,
-          fallbackBody
-        );
+        const fallbackPrepared = equationRenderData.commandContext &&
+          typeof contextTools.applyPreparedDocumentCommands === "function"
+          ? contextTools.applyPreparedDocumentCommands(equationRenderData.commandContext, fallbackBody)
+          : contextTools.prepareDocumentCommands(state.value, Number(context.openStart) || 0, fallbackBody);
         staging.replaceChildren();
         katex.render(fallbackPrepared.body, staging, {
           displayMode: Boolean(context.display ?? true),
@@ -3090,6 +3165,7 @@
     const pinnedTop = pinnedRect.top;
 
     output.replaceChildren(...staging.childNodes);
+    liveEquationRenderedBaseKey = renderedBaseKey;
     activePreviewContext = context;
     activePreviewState = { ...state };
     refreshLiveEquationEditSession(state, context);
@@ -3100,13 +3176,19 @@
     preview.hidden = false;
     preview.classList.add("smarttex-preview-visible");
 
-    const preparedFit = {
-      maxWidth: Number(preview.dataset.smarttexAutoFitMaxWidth) || undefined,
-      maxHeight: Number(preview.dataset.smarttexAutoFitMaxHeight) || undefined
-    };
-    applyPreviewAutoFitPolicyNow(preparedFit, {
-      allowGrow: preview.dataset.smarttexTemporarySized !== "true"
-    });
+    const preparedFit = sourceChanged
+      ? (preview.dataset.smarttexTemporarySized === "true"
+          ? {
+              maxWidth: Number(preview.dataset.smarttexAutoFitMaxWidth) || undefined,
+              maxHeight: Number(preview.dataset.smarttexAutoFitMaxHeight) || undefined
+            }
+          : (previewPopupUI?.prepareForReveal?.({ rebase: true }) || {}))
+      : null;
+    if (preparedFit) {
+      applyPreviewAutoFitPolicyNow(preparedFit, {
+        allowGrow: preview.dataset.smarttexTemporarySized !== "true"
+      });
+    }
     preview.style.left = pinnedLeftStyle || `${Math.round(pinnedLeft)}px`;
     preview.style.top = pinnedTopStyle || `${Math.round(pinnedTop)}px`;
     previewPositioned = true;
@@ -3117,11 +3199,13 @@
     // Store the newly valid source rendering immediately. Geometry can be
     // measured later by the idle warmer; the markup itself is enough to make a
     // subsequent opening a cache hit; background warming may add geometry later.
-    const markup = canonicalPreviewBaseMarkup(lastSuccessfulMarkup);
+    const markup = sourceChanged ? canonicalPreviewBaseMarkup(lastSuccessfulMarkup) : "";
     if (markup) {
       const baseKey = previewBaseCacheKey(state, context);
-      previewCacheSet(previewBaseRenderCache, baseKey, markup, null);
-      previewCacheSet(previewRenderCache, previewExactCacheKey(state, context), markup, null);
+      const metrics = previewCacheMetricsFromReveal(preparedFit);
+      const extras = { sourceSignature: previewSourceSignature(state) };
+      previewCacheSet(previewBaseRenderCache, baseKey, markup, metrics, extras);
+      previewCacheSet(previewRenderCache, previewExactCacheKey(state, context), markup, metrics, extras);
     }
     return true;
     } catch (error) {
@@ -3221,6 +3305,46 @@
       );
     }
     return contextTools.findEquationContext(cache.source, state.cursorIndex);
+  }
+
+  function readyEquationContextForState(state) {
+    if (!state || !enabledFeatures.equations) return null;
+    const source = String(state.value || "");
+    const fileName = String(state.fileName || "");
+    if (documentAnalysisCache.source !== source || documentAnalysisCache.fileName !== fileName ||
+        !documentAnalysisCache.equations) return null;
+    if (typeof contextTools.findEquationContextFromAnalysis === "function") {
+      return contextTools.findEquationContextFromAnalysis(
+        source,
+        state.cursorIndex,
+        documentAnalysisCache.equations
+      );
+    }
+    return null;
+  }
+
+  function readyPreviewContextForState(state) {
+    const equation = activeEquationContextForState(state) || readyEquationContextForState(state);
+    if (equation) return equation;
+    if (!state || referenceAutocompleteActive || captionInnerReferenceActive) return null;
+    const source = String(state.value || "");
+    if (backgroundPreviewContextIndex.source !== source ||
+        backgroundPreviewContextIndex.fileName !== String(state.fileName || "") ||
+        backgroundPreviewContextIndex.documentId !== String(state.documentId || "")) return null;
+    if (includeGraphicsArgumentAtCursor(state)) return null;
+    const cursor = Number(state.cursorIndex);
+    if (!Number.isInteger(cursor)) return null;
+    return backgroundPreviewContextIndex.entries
+      .filter((entry) => {
+        const range = contextEnvironmentRange(entry.context);
+        return cursor >= range.openStart && cursor <= range.closeEnd;
+      })
+      .sort((left, right) => {
+        const leftRange = contextEnvironmentRange(left.context);
+        const rightRange = contextEnvironmentRange(right.context);
+        return (leftRange.closeEnd - leftRange.openStart) -
+          (rightRange.closeEnd - rightRange.openStart);
+      })[0]?.context || null;
   }
 
   function equationRenderDataForState(state, context) {
@@ -3545,9 +3669,9 @@
     // to the current logical line instead of scanning the complete document
     // prefix after every keystroke. An includegraphics argument cannot legally
     // cross an unescaped line break in this completion context.
-    const scanStart = Math.max(0, cursor - 4096);
-    const masked = contextTools.maskIgnoredLatex(source);
-    const before = masked.slice(scanStart, cursor);
+    const lineStart = source.lastIndexOf("\n", Math.max(0, cursor - 1)) + 1;
+    const scanStart = Math.max(lineStart, cursor - 4096);
+    const before = contextTools.maskIgnoredLatex(source.slice(scanStart, cursor));
     const command = before.match(/\\includegraphics(?:\s*\[[^\]]*\])?\s*\{([^{}]*)$/i);
     if (!command) return null;
     const argumentStart = cursor - String(command[1] || "").length;
@@ -3660,6 +3784,8 @@
       "smarttex-graphic-autocomplete-click-preview"
     );
     graphicAutocompleteClose.hidden = false;
+    graphicAutocompleteMeta.textContent = "";
+    graphicAutocompleteMeta.removeAttribute("title");
     graphicAutocompleteOutput.replaceChildren();
   }
 
@@ -4114,7 +4240,7 @@
     // it under a fresh interaction task as well; otherwise a keyboard-aborted
     // generic render still on the stack can abort the caption update and force
     // a later cold reopen.
-    const liveTaskToken = interactionTasks?.begin?.("popup-live-caption") || null;
+    const liveTaskToken = interactionTasks?.begin?.("popup-live-caption", environmentPreviewTaskOptions()) || null;
     try {
     if (
       !captionPreviewLock ||
@@ -4452,16 +4578,19 @@
       state.anchorRect = null;
       if (state.popup) {
         state.popup.hidden = true;
+        state.popup.replaceChildren();
         state.popup.classList.remove("smarttex-reference-popup-compact");
         state.popup.style.removeProperty("width");
         state.popup.style.removeProperty("max-width");
         state.popup.removeAttribute("data-smarttex-content-kind");
+        state.popup.__smarttexKey = "";
         state.popup.__smarttexTargetKeys = new Set();
       }
     }
   }
 
   function hideCaptionReferencePopup() {
+    autocompleteReferencePreviewGeneration += 1;
     const restoreCaptionPreview = captionInnerReferenceActive;
     captionInnerReferenceActive = false;
     hidePopupLoadingSpinner();
@@ -4481,6 +4610,8 @@
     hideNestedReferencePopupsFromDepth(1);
     if (captionReferencePopup) {
       captionReferencePopup.hidden = true;
+      captionReferencePopup.replaceChildren();
+      delete captionReferencePopup.dataset.smarttexAutocompleteLabel;
       captionReferencePopup.classList.remove(
         "smarttex-editor-reference-popup",
         "smarttex-reference-popup-compact",
@@ -4490,6 +4621,7 @@
       captionReferencePopup.style.removeProperty("width");
       captionReferencePopup.style.removeProperty("max-width");
       captionReferencePopup.removeAttribute("data-smarttex-content-kind");
+      captionReferencePopup.__smarttexKey = "";
       captionReferencePopup.__smarttexTargetKeys = new Set();
     }
     if (restoreCaptionPreview) {
@@ -5059,17 +5191,21 @@
 
   function editorReferenceInteractionAtIndex(sourceValue, indexValue) {
     const source = String(sourceValue || "");
-    const masked = contextTools.maskIgnoredLatex(source);
     const index = Math.max(0, Math.min(Number(indexValue) || 0, source.length));
+    const scanStart = Math.max(0, index - 4096);
+    const scanEnd = Math.min(source.length, index + 4096);
+    const masked = contextTools.maskIgnoredLatex(source.slice(scanStart, scanEnd));
     const pattern = /\\(eqref|ref|pageref|autoref|cref|Cref|vref|Vref|nameref|cite|citep|citet|citealp|citealt|citeauthor|citeyear|parencite|textcite|autocite|footcite|smartcite|supercite|nocite)\*?(?:\s*\[[^\]]*\]){0,2}\s*\{([^{}]+)\}/g;
     let match;
     while ((match = pattern.exec(masked))) {
-      if (index < match.index || index > pattern.lastIndex) continue;
+      const sourceIndex = scanStart + match.index;
+      const sourceEnd = scanStart + pattern.lastIndex;
+      if (index < sourceIndex || index > sourceEnd) continue;
       return {
         command: match[1],
         labels: match[2].split(",").map((label) => label.trim()).filter(Boolean),
-        sourceIndex: match.index,
-        sourceEnd: pattern.lastIndex,
+        sourceIndex,
+        sourceEnd,
         type: /^(?:cite|citep|citet|citealp|citealt|citeauthor|citeyear|parencite|textcite|autocite|footcite|smartcite|supercite|nocite)$/i
           .test(match[1])
           ? "citation"
@@ -5091,8 +5227,9 @@
     if (!state || !Number.isInteger(state.cursorIndex)) return "";
     const source = String(state.value || "");
     const index = Math.max(0, Math.min(state.cursorIndex, source.length));
-    const masked = contextTools.maskIgnoredLatex(source);
-    const beforeCursor = masked.slice(0, index);
+    const lineStart = source.lastIndexOf("\n", Math.max(0, index - 1)) + 1;
+    const scanStart = Math.max(lineStart, index - 4096);
+    const beforeCursor = contextTools.maskIgnoredLatex(source.slice(scanStart, index));
     const match = beforeCursor.match(
       /\\(eqref|ref|pageref|autoref|cref|Cref|vref|Vref|nameref|cite|citep|citet|citealp|citealt|citeauthor|citeyear|parencite|textcite|autocite|footcite|smartcite|supercite|nocite)\*?(?:\s*\[[^\]]*\]){0,2}\s*\{[^{}]*$/i
     );
@@ -5138,7 +5275,7 @@
     for (const label of interaction?.labels || []) {
       const target = interaction?.type === "citation"
         ? localCitationTarget(source, label)
-        : contextTools.referenceTarget?.(source, label);
+        : cachedReferenceTarget(source, label);
       keys.add(referenceTargetKey(target, label));
     }
     return keys;
@@ -5239,7 +5376,7 @@
       }
     } else {
       for (const label of interaction.labels.slice(0, 8)) {
-        const target = contextTools.referenceTarget?.(source, label);
+        const target = cachedReferenceTarget(source, label);
         if (target) {
           editorReferenceEntry(popup, target, label, source);
         } else {
@@ -5336,7 +5473,7 @@
       }
     } else {
       for (const label of interaction.labels.slice(0, 8)) {
-        const target = contextTools.referenceTarget?.(source, label);
+        const target = cachedReferenceTarget(source, label);
         if (target) {
           editorReferenceEntry(popup, target, label, source);
         } else {
@@ -5393,6 +5530,15 @@
   }
 
   function updateCursorTriggeredReferencePopup(state = currentState) {
+    const token = interactionTasks?.begin?.("cursor-reference-popup", {
+      isCurrent: () => state === currentState,
+      surviveKeyboard: true
+    });
+    try { return updateCursorTriggeredReferencePopupNow(state); }
+    finally { if (token) interactionTasks.end(token); }
+  }
+
+  function updateCursorTriggeredReferencePopupNow(state = currentState) {
     if (referencePopupUsesHover()) return false;
     if (
       !state ||
@@ -5426,6 +5572,7 @@
       positionCaptionReferencePopup(anchorRect);
       return true;
     }
+    hideCaptionReferencePopup();
     const spinnerGeneration = showPopupLoadingSpinner(null, anchorRect);
     window.requestAnimationFrame(() => {
       try {
@@ -5596,7 +5743,7 @@
   function createCaptionReferenceLink(reference) {
     const label = String(reference?.label || "").trim();
     const command = String(reference?.command || "ref");
-    const target = contextTools.referenceTarget?.(currentState?.value, label);
+    const target = cachedReferenceTarget(currentState?.value, label);
     const link = document.createElement("a");
     link.className = "smarttex-document-reference smarttex-caption-reference";
     link.href = "#";
@@ -5828,19 +5975,32 @@
     const ownerRect = normalizedPopupRect(detail?.ownerRect);
     const clickMode = detail?.mode === "click" && detail?.zoomable === true;
     if (!currentState || !label || !anchorRect || !ownerRect) return;
-    const target = contextTools.referenceTarget?.(currentState.value, label);
-    if (!target || !referenceTargetPreviewEnabled(target)) {
-      autocompleteReferenceTargetKey = "";
-      hideCaptionReferencePopup();
+    if (
+      captionReferencePopup &&
+      !captionReferencePopup.hidden &&
+      captionReferencePopup.dataset.smarttexAutocompleteOwner === "reference" &&
+      captionReferencePopup.dataset.smarttexAutocompleteLabel === label
+    ) {
+      positionAutocompleteReferencePopup(anchorRect, ownerRect);
       return;
     }
-    autocompleteReferenceTargetKey = referenceTargetKey(target, label);
+    hideCaptionReferencePopup();
+    const state = currentState;
+    const generation = ++autocompleteReferencePreviewGeneration;
     const spinnerGeneration = showPopupLoadingSpinner({
       clientX: (anchorRect.left + anchorRect.right) / 2,
       clientY: (anchorRect.top + anchorRect.bottom) / 2
     }, anchorRect);
     window.requestAnimationFrame(() => {
       try {
+        if (generation !== autocompleteReferencePreviewGeneration || currentState !== state) return;
+        const target = cachedReferenceTarget(state.value, label);
+        if (!target || !referenceTargetPreviewEnabled(target)) {
+          autocompleteReferenceTargetKey = "";
+          hideCaptionReferencePopup();
+          return;
+        }
+        autocompleteReferenceTargetKey = referenceTargetKey(target, label);
         const popup = ensureCaptionReferencePopup();
         renderEditorReferencePopup(anchorRect, {
           command: String(detail?.command || "ref"),
@@ -5857,6 +6017,7 @@
         popup.dataset.smarttexAutocompleteOwner = clickMode
           ? "reference-click"
           : "reference";
+        popup.dataset.smarttexAutocompleteLabel = label;
         if (clickMode) addEquationReferencePopupZoom(popup, anchorRect, ownerRect);
         positionAutocompleteReferencePopup(anchorRect, ownerRect);
       } finally {
@@ -6768,12 +6929,23 @@
       relativeScale: Number(prepared.relativeScale) || 1,
       viewportWidth: window.innerWidth,
       viewportHeight: window.innerHeight,
+      fontSignature: previewFontSignature(),
       maxWidth: Number(prepared.maxWidth) || 0,
       maxHeight: Number(prepared.maxHeight) || 0,
       finalSize: { width: rect.width, height: rect.height },
       autoFitZoom: previewAutoFitZoom,
       scrollFallback: preview.classList.contains("smarttex-preview-scroll-fallback")
     };
+  }
+
+  function previewFontSignature() {
+    const style = globalThis.getComputedStyle?.(output);
+    return [
+      style?.fontFamily || "",
+      style?.fontSize || "",
+      style?.lineHeight || "",
+      Number(globalThis.devicePixelRatio) || 1
+    ].join("::");
   }
 
   function applyCachedEquationLineMode(context, metrics) {
@@ -6819,14 +6991,23 @@
       preview.dataset.smarttexStaging = "true";
       preview.hidden = false;
       previewLoadingIndicator.hidden = true;
-      const prepared = previewPopupUI?.prepareCachedForReveal?.(cached.metrics);
+      const compatibleMetrics = cached.metrics?.fontSignature === previewFontSignature()
+        ? cached.metrics
+        : { ...cached.metrics, finalSize: null };
+      const prepared = previewPopupUI?.prepareCachedForReveal?.(compatibleMetrics);
       if (prepared) {
         // Cached markup and intrinsic geometry are reusable, but the *fitted*
         // dimensions are not authoritative. Revalidate against the live DOM and
         // current font metrics so a warm equation fits identically to a freshly
         // parsed one. This is synchronous: layout reads force only the minimal
         // browser layout work and still avoid parsing/KaTeX/image decoding.
-        applyPreviewAutoFitPolicyNow(prepared);
+        if (prepared.cacheCompatible) {
+          previewAutoFitZoom = Math.max(0.75, Math.min(1, Number(cached.metrics.autoFitZoom) || 1));
+          refreshPreviewZoom();
+          preview.classList.toggle("smarttex-preview-scroll-fallback", Boolean(cached.metrics.scrollFallback));
+        } else {
+          applyPreviewAutoFitPolicyNow(prepared);
+        }
         if (generation !== renderGeneration || contextId !== activeContextId) return false;
         const liveMetrics = previewCacheMetricsFromReveal(prepared);
         if (liveMetrics) cached.metrics = liveMetrics;
@@ -6893,7 +7074,11 @@
     // A source diagnostic should mean "ready for the fast opening path", not
     // merely that some markup exists. Partial legacy entries are rebuilt here
     // until they contain measured natural geometry.
-    if (existingWarmEntry?.markup && existingWarmEntry?.metrics?.naturalSize) return;
+    if (
+      existingWarmEntry?.markup &&
+      existingWarmEntry?.metrics?.naturalSize &&
+      existingWarmEntry.sourceSignature === sourceSignature
+    ) return;
 
     const staging = document.createElement("div");
     if (kind === "figure") {
@@ -6998,7 +7183,7 @@
         baseKey,
         stableMarkup,
         metrics,
-        { mediaKeepalive }
+        { mediaKeepalive, sourceSignature }
       );
       // The source-line diagnostic represents a fully measured cache entry for
       // the current source signature. It therefore predicts the actual fast
@@ -7010,10 +7195,15 @@
     const source = String(state?.value || "");
     if (!source) return [];
 
-    const numbered = numberedOutlineEntriesForState(state).map((entry) => ({
-      ...entry,
-      smarttexOutlineEntry: true
-    }));
+    const numbered = numberedOutlineEntriesForState(state).map((entry) => {
+      const target = numberedOutlinePreviewContext(entry);
+      return {
+        ...entry,
+        context: target?.context || entry.context || null,
+        numbering: target?.numbering || entry.numbering || null,
+        smarttexOutlineEntry: true
+      };
+    });
     const entries = [...numbered];
     const seen = new Set(numbered.map((entry) => (
       `${String(entry.type || "")}::${Math.max(0, Number(entry.sourceIndex) || 0)}`
@@ -7088,7 +7278,33 @@
           contextTools.findTableContext?.(value, index)
         )
       );
+      const standaloneTableExpression = /\\begin\s*\{(?:tabular\*?|longtable)\}/gi;
+      let standaloneMatch;
+      while ((standaloneMatch = standaloneTableExpression.exec(source))) {
+        const context = contextTools.findTableContext?.(source, standaloneMatch.index + standaloneMatch[0].length);
+        if (!context) continue;
+        const enclosingFloat = contextTools.findTableFloatContext?.(source, Number(context.openStart) + 1);
+        if (enclosingFloat && Number(enclosingFloat.openStart) < Number(context.openStart) &&
+            Number(enclosingFloat.closeEnd) >= Number(context.closeEnd)) continue;
+        const sourceIndex = Math.max(0, Number(context.openStart ?? standaloneMatch.index) || 0);
+        const key = `table::${sourceIndex}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        entries.push({ type: "table", sourceIndex, context, smarttexOutlineEntry: false });
+      }
     }
+    entries.sort((left, right) => (
+      Math.abs(Number(left.sourceIndex) - Number(state?.cursorIndex || 0)) -
+      Math.abs(Number(right.sourceIndex) - Number(state?.cursorIndex || 0))
+    ));
+    backgroundPreviewContextIndex = {
+      fileName: String(state?.fileName || ""),
+      documentId: String(state?.documentId || ""),
+      source,
+      entries: entries
+        .map((entry) => ({ kind: String(entry?.type || ""), context: entry?.context || null }))
+        .filter((entry) => entry.context && ["equation", "figure", "table"].includes(entry.kind))
+    };
     return entries;
   }
 
@@ -7126,6 +7342,14 @@
       previewCacheWarmTimer = null;
       const run = async () => {
         if (generation !== previewCacheWarmGeneration || signature !== previewSourceSignature(currentState)) return;
+        if (environmentPreviewSession || !preview.hidden) {
+          window.setTimeout(() => {
+            if (generation === previewCacheWarmGeneration && signature === previewSourceSignature(currentState)) {
+              schedulePreviewCacheWarm({ initial: false });
+            }
+          }, 250);
+          return;
+        }
         const sourceLength = String(currentState?.value || "").length;
         if (interactionTasks?.canRunBackgroundTask &&
             !interactionTasks.canRunBackgroundTask(currentState, sourceLength)) return;
@@ -7210,18 +7434,20 @@
     }, startDelay);
   }
 
-  function warmPreviewCacheForStateContext(state, context) {
+  function warmPreviewCacheForStateContext(state, context, { allowPrevious = false } = {}) {
     const exactKey = previewExactCacheKey(state, context);
     // A cache entry is useful even before its geometry has been measured.
     // Reusing cached markup and doing only the hidden measurement is still much
     // cheaper than reparsing/rerendering the environment. Previously such
     // markup-only entries were ignored here, which made cache use appear
     // intermittent even though rendered content was already available.
+    const sourceSignature = previewSourceSignature(state);
     const exact = normalizedPreviewCacheEntry(lruCacheGet(previewRenderCache, exactKey));
     if (exact?.markup) {
       return {
         entry: exact,
         exact: true,
+        stale: Boolean(exact.sourceSignature && exact.sourceSignature !== sourceSignature),
         measured: Boolean(exact.metrics?.naturalSize),
         exactKey,
         baseKey: previewBaseCacheKey(state, context)
@@ -7233,12 +7459,202 @@
       return {
         entry: base,
         exact: false,
+        stale: Boolean(base.sourceSignature && base.sourceSignature !== sourceSignature),
         measured: Boolean(base.metrics?.naturalSize),
         exactKey,
         baseKey
       };
     }
+    if (allowPrevious) {
+      const identity = previewEnvironmentIdentity(state, context);
+      const previous = lruCacheGet(previousEnvironmentRenderCache, identity);
+      // The old identity counts equal source occurrences, so distinct environments
+      // can share it. Never use another environment's last frame as a fallback.
+      if (previous?.entry?.markup && previous.sourceKey === baseKey) {
+        return { entry: previous.entry, exact: false, stale: previous.sourceKey !== baseKey,
+          measured: Boolean(previous.entry.metrics?.naturalSize), exactKey, baseKey };
+      }
+    }
     return null;
+  }
+
+  function environmentPreviewTaskOptions(session = environmentPreviewSession, surviveKeyboard = false) {
+    return session ? {
+      isCurrent: () => environmentPreviewSession === session,
+      surviveKeyboard: Boolean(surviveKeyboard)
+    } : { surviveKeyboard: Boolean(surviveKeyboard) };
+  }
+
+  function cancelEnvironmentPreviewSession() {
+    const session = environmentPreviewSession;
+    if (!session) return;
+    environmentPreviewSession = null;
+    window.clearTimeout(session.timer);
+    renderGeneration += 1;
+  }
+
+  function previewSnapshotChanged(previous, next) {
+    return !previous || previous.value !== next.value || previous.cursorIndex !== next.cursorIndex ||
+      previous.selectionFrom !== next.selectionFrom || previous.selectionTo !== next.selectionTo;
+  }
+
+  function previewRangeAfterEdit(range, previous, next) {
+    if (previous === next) return { ...range };
+    let start = 0;
+    while (start < previous.length && start < next.length && previous[start] === next[start]) start += 1;
+    let oldEnd = previous.length;
+    let newEnd = next.length;
+    while (oldEnd > start && newEnd > start && previous[oldEnd - 1] === next[newEnd - 1]) {
+      oldEnd -= 1;
+      newEnd -= 1;
+    }
+    const mapBoundary = (offset, right) => {
+      if (offset < start || (offset === start && !right)) return offset;
+      if (offset >= oldEnd) return offset + newEnd - oldEnd;
+      return right ? newEnd : start;
+    };
+    return { openStart: mapBoundary(range.openStart, true), closeEnd: mapBoundary(range.closeEnd, false) };
+  }
+
+  function queueEnvironmentPreview(state, contextHint = null, { allowFreshLookup = true } = {}) {
+    if (environmentPopupUsesHover()) return false;
+    let session = environmentPreviewSession;
+    if (session) {
+      const range = previewRangeAfterEdit(session.range, session.state.value, String(state?.value || ""));
+      const cursor = Number(state?.cursorIndex);
+      const sameDocument = state && state.fileName === session.state.fileName &&
+        String(state.documentId || "") === String(session.state.documentId || "");
+      const inside = sameDocument && Number.isInteger(cursor) &&
+        cursor >= range.openStart && cursor <= range.closeEnd;
+      if (!inside) {
+        if (!sameDocument) previousEnvironmentRenderCache.clear();
+        hidePreview({ force: true });
+        session = null;
+      } else {
+        const cursorOnlyUpdate = Boolean(
+          session.renderedState &&
+          String(session.state.value || "") === String(state.value || "") &&
+          previewSnapshotChanged(session.state, state)
+        );
+        // Hosts can briefly lose focus/coordinates while committing text. That
+        // bookkeeping does not end ownership while the caret remains inside.
+        state = { ...state, focused: state.focused !== false || session.state.focused !== false,
+          screen: state.screen || session.state.screen };
+        session.range = range;
+        session.state = state;
+        scheduleEnvironmentPreviewSession(session, cursorOnlyUpdate);
+        return true;
+      }
+    }
+    if (!stateCanShowPreview(state) || stateIsInsideDismissedPreview(state)) return false;
+    // This short lookup belongs to the foreground preview, not cancellable
+    // background indexing. Source parsing is cached for cursor-only changes.
+    const readyContext = contextHint || readyPreviewContextForState(state);
+    if (!readyContext && !allowFreshLookup) return false;
+    const token = interactionTasks?.begin?.("popup-environment-entry", {
+      isCurrent: () => true,
+      surviveKeyboard: Boolean(readyContext)
+    });
+    let context;
+    try { context = readyContext || findPreviewContext(state); }
+    catch (error) {
+      if (interactionTasks?.isAbortError?.(error)) return true;
+      throw error;
+    }
+    finally { if (token) interactionTasks.end(token); }
+    if (!context || previewContextIsDismissed(state, context)) return false;
+    resetPreviewOpening();
+    session = { state, context, range: contextEnvironmentRange(context), running: false,
+      timer: null, renderedState: null, refreshRequested: false, immediateRequested: false };
+    environmentPreviewSession = session;
+    scheduleEnvironmentPreviewSession(session, true);
+    return true;
+  }
+
+  function scheduleEnvironmentPreviewSession(session, immediate = false) {
+    if (session !== environmentPreviewSession) return;
+    if (immediate) session.immediateRequested = true;
+    if (session.running) return;
+    if (session.timer !== null) {
+      if (!session.immediateRequested) return;
+      window.clearTimeout(session.timer);
+      session.timer = null;
+    }
+    if (!session.refreshRequested && !previewSnapshotChanged(session.renderedState, session.state)) {
+      activePreviewState = { ...activePreviewState, screen: session.state.screen };
+      window.requestAnimationFrame(() => positionPreviewAtCursor());
+      return;
+    }
+    // Coalesce waiting edits without resetting this timer on every keystroke.
+    const typingDelay = globalThis.document?.documentElement?.getAttribute?.("data-smarttex-editor-typing") === "true"
+      ? Math.max(0, Number(interactionTasks?.keyboardIdleRemaining?.()) || 0)
+      : 0;
+    const cacheOnly = session.immediateRequested && typingDelay > 0;
+    const runImmediately = session.immediateRequested && typingDelay === 0;
+    session.immediateRequested = false;
+    if (runImmediately || cacheOnly) {
+      void runEnvironmentPreviewSession(session, { cacheOnly });
+      return;
+    }
+    session.timer = window.setTimeout(
+      () => void runEnvironmentPreviewSession(session),
+      Math.max(48, typingDelay)
+    );
+  }
+
+  async function runEnvironmentPreviewSession(session, { cacheOnly = false } = {}) {
+    session.timer = null;
+    if (session !== environmentPreviewSession) return;
+    session.running = true;
+    const state = { ...session.state };
+    const opening = !session.renderedState;
+    let completed = false;
+    session.refreshRequested = false;
+    const token = interactionTasks?.begin?.("popup-environment-refresh", environmentPreviewTaskOptions(session));
+    try {
+      const context = opening ? session.context : findPreviewContext(state);
+      // Incomplete TeX keeps the last valid frame. A later edit retries it.
+      if (!context) return;
+      if (previewContextId(state, context) !== previewContextId(state, session.context)) {
+        hidePreview({ force: true });
+        queueEnvironmentPreview(session.state, context);
+        return;
+      }
+      const generation = ++renderGeneration;
+      const warm = opening ? warmPreviewCacheForStateContext(state, context, { allowPrevious: true }) : null;
+      if (cacheOnly && !warm) {
+        session.refreshRequested = true;
+        return;
+      }
+      if (token) token.surviveKeyboard = Boolean(warm);
+      scheduledPreviewHint = { generation, state, context, warm };
+      if (!opening && previewElementKind(context) === "equation" && !preview.hidden &&
+          preview.dataset.smarttexStaging !== "true") {
+        await renderLiveEquationInPlace(state, context);
+      } else {
+        const result = await renderPreview(generation, null, {
+          state, context, session, skipWarm: !opening, allowCachedDuringKeyboard: Boolean(warm)
+        });
+        if (cacheOnly && result !== true) {
+          session.refreshRequested = true;
+          return;
+        }
+      }
+      completed = true;
+      // Finish/reveal the captured snapshot even if more keys arrived while it
+      // rendered. Then refresh from the single newest buffered snapshot.
+      if (warm) {
+        const needsTransientEquationState = previewElementKind(context) === "equation" && !warm.exact;
+        session.refreshRequested = Boolean(warm.stale || needsTransientEquationState);
+      }
+    } catch (error) {
+      if (!interactionTasks?.isAbortError?.(error)) console.warn("SmartTeX environment refresh failed:", error);
+    } finally {
+      if (token) interactionTasks.end(token);
+      session.running = false;
+      if (completed) session.renderedState = state;
+      if (session === environmentPreviewSession) scheduleEnvironmentPreviewSession(session);
+    }
   }
 
   function previewHintMatchesState(hint, state) {
@@ -7254,8 +7670,8 @@
     );
   }
 
-  async function tryFastWarmPreview(generation, hint = null) {
-    const state = previewStateForRender();
+  async function tryFastWarmPreview(generation, hint = null, snapshot = null) {
+    const state = snapshot || previewStateForRender();
     if (generation !== renderGeneration || !stateCanShowPreview(state)) return null;
     const usableHint = hint?.generation === generation && previewHintMatchesState(hint, state)
       ? hint
@@ -7271,6 +7687,7 @@
     const contextId = previewContextId(state, context);
     const contextChanged = contextId !== activeContextId;
     if (contextChanged) {
+      resetPreviewOpening();
       activeContextId = contextId;
       caretPlacementState = null;
       lastSuccessfulMarkup = "";
@@ -7303,8 +7720,11 @@
     return { ...warm, state, context, contextId };
   }
 
-  async function renderPreview(generation, loadingGeneration = null) {
-    const taskToken = interactionTasks?.begin?.("popup-preview-render") || null;
+  async function renderPreview(generation, loadingGeneration = null, job = null) {
+    const taskToken = interactionTasks?.begin?.(
+      "popup-preview-render",
+      environmentPreviewTaskOptions(job?.session, job?.allowCachedDuringKeyboard)
+    ) || null;
     try {
     renderTimer = null;
     // A measured warm cache can be shown immediately: no spinner-paint delay,
@@ -7312,19 +7732,23 @@
     // needed. Base (cursor-independent) equation caches are shown immediately
     // and then refined below with the cursor-specific markup in the background.
     await Promise.all([featureSettingsReady, popupSettingsReady]);
+    taskCheckpoint(0, 1, taskToken);
     const renderHint = scheduledPreviewHint?.generation === generation
       ? scheduledPreviewHint
       : null;
     if (renderHint) scheduledPreviewHint = null;
-    const warmPreview = await tryFastWarmPreview(generation, renderHint);
+    const warmPreview = job?.skipWarm ? null : await tryFastWarmPreview(generation, renderHint, job?.state);
     if (warmPreview) {
       // Background warming stores cursor-independent equation markup. Once that
       // base cache has populated the opening frame, do not immediately continue
       // into a cold cursor-specific KaTeX render; doing so defeated first-open
       // caching and made the popup diagnostic appear uncached. Cursor/source
       // changes can update the already-visible equation in place later.
-      return;
+      return true;
     }
+    // A cache-only transaction may cross a keypress, but a failed/stale cache
+    // reveal must not turn into fresh parser/render/layout work afterwards.
+    if (taskToken?.keyboardInterrupted) return;
     if (!warmPreview && loadingGeneration !== null && loadingGeneration !== undefined) {
       await nextPreviewFrame();
       await nextPreviewFrame();
@@ -7332,7 +7756,7 @@
     }
     await katexFontsReady;
     taskCheckpoint(0, 1, taskToken);
-    const state = previewStateForRender();
+    const state = job?.state || previewStateForRender();
     // A superseded async render must never hide or invalidate the newer one.
     // This is common while the first equation keystrokes are waiting for fonts
     // or settings: the stale job simply yields ownership to the latest job.
@@ -7342,9 +7766,9 @@
       return;
     }
 
-    const context = renderHint && previewHintMatchesState(renderHint, state)
+    const context = job?.context || (renderHint && previewHintMatchesState(renderHint, state)
       ? renderHint.context
-      : findPreviewContext(state);
+      : findPreviewContext(state));
     taskCheckpoint(0, 1, taskToken);
     if (!context) {
       hidePreview();
@@ -7363,6 +7787,7 @@
       ? []
       : capturePopupScrollState(preview);
     if (contextChanged) {
+      resetPreviewOpening();
       activeContextId = contextId;
       caretPlacementState = null;
       lastSuccessfulMarkup = "";
@@ -7446,6 +7871,10 @@
     const cachedExactEntry = normalizedPreviewCacheEntry(
       lruCacheGet(previewRenderCache, exactRenderCacheKey)
     );
+    const cachedExactIsCurrent = Boolean(
+      cachedExactEntry &&
+      (!cachedExactEntry.sourceSignature || cachedExactEntry.sourceSignature === previewSourceSignature(state))
+    );
     let cachedOpeningRevealed = false;
     const needsFloatCaretRefresh = Boolean(
       caretInFloatCaption ||
@@ -7464,7 +7893,7 @@
         // refresh when the editor caret is in a caption (or table body), rather
         // than returning with a caret-less cached caption.
         cachedOpeningRevealed = true;
-        if (!needsFloatCaretRefresh) return;
+        if (cachedExactIsCurrent && !needsFloatCaretRefresh) return;
       }
     }
 
@@ -7774,7 +8203,8 @@
         previewRenderCache,
         exactRenderCacheKey,
         cacheableMarkup,
-        normalizedPreviewCacheEntry(previewRenderCache.get(exactRenderCacheKey))?.metrics || null
+        normalizedPreviewCacheEntry(previewRenderCache.get(exactRenderCacheKey))?.metrics || null,
+        { sourceSignature: previewSourceSignature(state) }
       );
     }
     restorePopupScrollState(preview, previewScrollState);
@@ -7796,7 +8226,8 @@
       const revealed = await revealStagedPreview(generation, contextId, { rebase: true });
       if (!revealed) return;
       if (cacheableMarkup && revealed.metrics) {
-        previewCacheSet(previewRenderCache, exactRenderCacheKey, cacheableMarkup, revealed.metrics);
+        const extras = { sourceSignature: previewSourceSignature(state) };
+        previewCacheSet(previewRenderCache, exactRenderCacheKey, cacheableMarkup, revealed.metrics, extras);
         // Keep one cursor-independent measured rendering for every unselected
         // environment. This is the fast path used when the caret later moves
         // inside the same figure/table/equation without a source change.
@@ -7805,7 +8236,8 @@
             previewBaseRenderCache,
             baseRenderCacheKey,
             cacheableMarkup,
-            revealed.metrics
+            revealed.metrics,
+            extras
           );
         }
       }
@@ -7817,14 +8249,22 @@
       // already-fitted rectangle as a new natural size and is one source of
       // cache/fresh-path divergence. The live fit below owns resizing here.
       refreshPreviewZoom();
-      const prepared = {
-        maxWidth: Number(preview.dataset.smarttexAutoFitMaxWidth) || undefined,
-        maxHeight: Number(preview.dataset.smarttexAutoFitMaxHeight) || undefined
-      };
+      const prepared = preview.dataset.smarttexTemporarySized === "true"
+        ? {
+            maxWidth: Number(preview.dataset.smarttexAutoFitMaxWidth) || undefined,
+            maxHeight: Number(preview.dataset.smarttexAutoFitMaxHeight) || undefined
+          }
+        : (previewPopupUI?.prepareForReveal?.({ rebase: true }) || {});
       await applyPreviewAutoFitPolicy(prepared, {
         allowGrow: preview.dataset.smarttexTemporarySized !== "true"
       });
+      if (generation !== renderGeneration || contextId !== activeContextId) return;
+      if (cacheableMarkup && !hasSelection) {
+        previewCacheSet(previewBaseRenderCache, baseRenderCacheKey, cacheableMarkup,
+          previewCacheMetricsFromReveal(prepared), { sourceSignature: previewSourceSignature(state) });
+      }
       window.requestAnimationFrame(() => {
+        if (generation !== renderGeneration || contextId !== activeContextId) return;
         if (!previewPositioned) positionPreview();
         else positionPreviewAtCursor();
       });
@@ -7854,6 +8294,7 @@
         return;
       }
       const contextId = previewContextId(state, context);
+      if (contextId !== activeContextId) resetPreviewOpening();
       activeContextId = contextId;
       showRenderError(contextId, context, error);
     });
@@ -7877,6 +8318,8 @@
       hidePreview();
       return;
     }
+
+    if (!deferContextLookup && queueEnvironmentPreview(state, contextHint)) return;
 
     // Defense in depth for the mounted-environment ownership invariant above.
     // Other extension subsystems can request scheduleRender() independently of
@@ -8117,14 +8560,35 @@
 
   ensureNumberedOutlineObserver();
 
+  window.addEventListener("smarttex:preview-editor-state", (event) => {
+    if (!popupInteractionReady()) return;
+    try {
+      const state = JSON.parse(String(event.detail || "null"));
+      if (!state) return;
+      currentState = state;
+      if (!referencePopupUsesHover()) updateCursorTriggeredReferencePopup(state);
+      if (
+        state.focused !== false &&
+        !preview.hidden &&
+        !activeEnvironmentPreviewContainsState(state)
+      ) hidePreview({ force: true });
+      if (!environmentPopupUsesHover()) {
+        queueEnvironmentPreview(state, null, { allowFreshLookup: false });
+      }
+    } catch (error) {
+      if (!interactionTasks?.isAbortError?.(error)) console.warn("SmartTeX preview state failed:", error);
+    }
+  });
+
   window.addEventListener(STATE_EVENT, (event) => {
-    const previousState = currentState;
+    const previousState = lastGeneralEditorState;
     const previousSource = String(previousState?.value || "");
     const previousFileName = String(previousState?.fileName || "");
     try {
       currentState = interactionTasks?.parseEditorState
         ? interactionTasks.parseEditorState(event.detail)
         : JSON.parse(String(event.detail || "null"));
+      lastGeneralEditorState = currentState;
     } catch (_error) {
       hoverPreviewState = null;
       hidePreview();
@@ -8176,6 +8640,7 @@
       hideCaptionReferencePopup();
       return;
     }
+    if (queueEnvironmentPreview(currentState)) return;
     const recentEditorTyping = Boolean(
       sourceChanged &&
       Date.now() - lastEditorTextInputAt < 500 &&
@@ -8774,7 +9239,10 @@
       hideStructureHoverPreview();
     }
   }, true);
-  window.addEventListener("scroll", () => hideStructureHoverPreview(), true);
+  window.addEventListener("scroll", () => {
+    if (interactionTasks?.isScrolling?.()) return;
+    hideStructureHoverPreview();
+  }, true);
   window.addEventListener("blur", () => {
     hideStructureHoverPreview();
     restoreStructureHoverTooltips();
@@ -8884,57 +9352,29 @@
   }, { passive: true });
   window.addEventListener("smarttex:editor-scroll-state", (event) => {
     if (event?.detail?.active === true) {
-      const activeCaptionEdit = Boolean(
-        !preview.hidden &&
-        captionContainerAtIndex(currentState) &&
-        stateContinuesActiveEnvironmentPreview(currentState)
-      );
-      // Typing can make CollabTeX auto-scroll the editor to keep the caret in
-      // view. An equation edit session is stronger evidence of an ongoing edit
-      // than the short generic input-time window, so never let that auto-scroll
-      // close the live equation popup merely because the scroll event arrives
-      // a few hundred milliseconds after the key event.
-      const activeEquationEdit = liveEquationEditSessionContainsState(currentState);
-      const activeEnvironmentEdit = activeEnvironmentPreviewContainsState(currentState);
-      const keepTypingOverlays = Boolean(
-        activeCaptionEdit ||
-        activeEquationEdit ||
-        activeEnvironmentEdit ||
-        (
-          Date.now() - lastEditorTextInputAt < 350 &&
-          currentState?.focused !== false
-        )
-      );
-      if (keepTypingOverlays) {
-        popupsSuppressedAfterEditorScroll = false;
-        // An editor auto-scroll caused by typing belongs to the same editing
-        // interaction. Keep all active previews mounted and refresh only their
-        // content/position from the state updates already in flight.
-        window.requestAnimationFrame(() => {
-          positionPreviewAtCursor();
-          repositionReferencePopups();
-          scheduleGraphicAutocompletePreviewUpdate();
-        });
-        return;
-      }
       popupsSuppressedAfterEditorScroll = true;
-      window.clearTimeout(editorReferenceHoverTimer);
-      editorReferenceHoverGeneration += 1;
-      window.clearTimeout(environmentHoverTimer);
-      environmentHoverTimer = null;
-      environmentHoverGeneration += 1;
-      hoverPreviewState = null;
-      hidePreview();
+      cancelPendingEnvironmentPreviewRender();
+      hidePreview({ clearDismissal: false, force: true });
       hideCaptionReferencePopup();
       hideNestedReferencePopupsFromDepth(1);
       hideGraphicAutocompletePreview();
+      hideStructureHoverPreview();
       return;
     }
-    // Highlights and source-number badges are repositioned by page-bridge.js.
-    // Popups are intentionally not restored after scrolling. They may open again
-    // only after a subsequent cursor, keyboard, pointer or hover interaction.
+    window.clearTimeout(editorReferenceHoverTimer);
+    editorReferenceHoverGeneration += 1;
+    window.clearTimeout(environmentHoverTimer);
+    environmentHoverTimer = null;
+    environmentHoverGeneration += 1;
+    hoverPreviewState = null;
+    hidePreview();
+    hideCaptionReferencePopup();
+    hideNestedReferencePopupsFromDepth(1);
+    hideGraphicAutocompletePreview();
+    hideStructureHoverPreview();
   });
   window.addEventListener("scroll", (event) => {
+    if (interactionTasks?.isScrolling?.()) return;
     if (referencePopupContains(event.target)) {
       keepReferencePopupOpen(event);
       return;

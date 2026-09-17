@@ -343,6 +343,9 @@ E = mc^2 + \frac{a_{1}^4+b_{1}^4}{1+x_{1}^2} + \frac{a_{2}^4+b_{2}^4}{1+x_{2}^2}
       ));
       await delay(20);
       const autocompleteHidden = Boolean(autocompletePopup?.hidden);
+      const autocompleteContentCleared = Boolean(
+        autocompletePopup?.hidden && autocompletePopup.childElementCount === 0
+      );
 
       window.dispatchEvent(new CustomEvent("smarttex:reference-autocomplete-preview", {
         detail: JSON.stringify({
@@ -449,7 +452,8 @@ E = mc^2 + \frac{a_{1}^4+b_{1}^4}{1+x_{1}^2} + \frac{a_{2}^4+b_{2}^4}{1+x_{2}^2}
           autocompleteOwned &&
           autocompletePreviewStayedOpen &&
           autocompleteTitle?.textContent === "Equation 1" &&
-          autocompleteHidden
+          autocompleteHidden &&
+          autocompleteContentCleared
         ),
         autocompleteAllowsDifferentTarget: differentTargetAllowed,
         autocompleteAvoidsDuplicateTarget: sameTargetNotDuplicated,

@@ -99,6 +99,7 @@
     };
   </script>
   <script src="../latex-context.js"></script>
+  <script src="../table-renderer.js"></script>
   <script src="../reference-autocomplete.js"></script>
   <script>
     const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -207,6 +208,21 @@ Use ${command}`;
       }));
     }
 
+    function sendPreviewSourceAt(value, cursorIndex) {
+      window.dispatchEvent(new CustomEvent("smarttex:preview-editor-state", {
+        detail: JSON.stringify({
+          value,
+          cursorIndex,
+          selectionFrom: cursorIndex,
+          selectionTo: cursorIndex,
+          screen: { pageX: 280, pageY: 180, lineHeight: 20 },
+          fileName: "main.tex",
+          focused: true,
+          editorKind: "codemirror"
+        })
+      }));
+    }
+
     async function waitForPopup() {
       for (let attempt = 0; attempt < 80; attempt += 1) {
         const popup = document.querySelector("#smarttex-reference-autocomplete-popup:not([hidden])");
@@ -257,7 +273,7 @@ Use ${command}`;
         request.type === "setReferenceAutocompleteActive" && request.active === true
       ));
       await waitFor(() => previewLabels.at(-1) === "z:section");
-      checks.initialPreview = previewLabels.at(-1) === "z:section";
+      checks.sectionHasNoPreview = previewLabels.at(-1) !== "z:section" && previewHideCount > 0;
 
       document.dispatchEvent(new KeyboardEvent("keydown", {
         key: "ArrowDown", bubbles: true, cancelable: true
@@ -307,7 +323,7 @@ Use ${command}`;
 
       sendState(String.raw`\eqref{`);
       await waitForPopup();
-      await delay(50);
+      await waitFor(() => labels().length === 1 && labels()[0] === "eq:first" && !document.querySelector(".smarttex-reference-autocomplete-view")?.hidden);
       checks.eqrefOnlyEquations = JSON.stringify(labels()) === JSON.stringify(["eq:first"]);
       const equationViewButton = document.querySelector(
         ".smarttex-reference-autocomplete-view"
@@ -439,6 +455,7 @@ Use ${command}`;
         ".smarttex-reference-autocomplete-label"
       );
       checks.existingReferenceSelected = selectedExisting?.textContent === "fig:alpha";
+      await waitFor(() => previewLabels.at(-1) === "fig:alpha");
       checks.existingReferencePreview = previewLabels.at(-1) === "fig:alpha";
       checks.activeEvent = activeStates.includes(true);
 
@@ -503,6 +520,16 @@ Use \ref{`);
         numberedDescriptions.some((text) => text.startsWith("Section I.A — Main subsection")) &&
         numberedDescriptions.some((text) => text.startsWith("Section A — Appendix section"))
       );
+
+      sendState("plain text");
+      await delay(40);
+      sendCustomSource(String.raw`\section{Energy $E=mc^2$}\label{sec:math}
+Use \ref{`);
+      await waitForPopup();
+      checks.sectionInlineMathRendered = Boolean(await waitFor(() => (
+        document.querySelector(".smarttex-reference-autocomplete-description .katex")
+      )));
+      checks.sectionMathHasNoPreview = previewLabels.at(-1) !== "sec:math";
 
       sendState("plain text");
       await delay(40);
@@ -609,8 +636,9 @@ Use \ref{`);
         })
       }));
       await delay(50);
-      checks.transientTypingStateKeepsListVisible = !persistentPopup.hidden;
+      checks.transientTypingStateMayCloseList = persistentPopup.hidden;
       sendCustomSource(`${manySections}\nUse \\ref{sec:2`);
+      await waitForPopup();
       await waitFor(() => labels().length > 0 && labels().every((label) => label.includes("2")));
       document.dispatchEvent(new InputEvent("input", {
         bubbles: true,
@@ -620,15 +648,27 @@ Use \ref{`);
       window.dispatchEvent(new CustomEvent("smarttex:editor-scroll-state", {
         detail: { active: true, reason: "typing-auto-scroll" }
       }));
-      checks.typingUpdatesSamePopup = Boolean(
+      checks.scrollClosesPopupImmediately = Boolean(
         document.querySelector("#smarttex-reference-autocomplete-popup") === persistentPopup &&
-        !persistentPopup.hidden &&
-        labels().length > 0 &&
-        labels().every((label) => label.includes("2"))
+        persistentPopup.hidden
       );
       await delay(60);
       typingVisibilityObserver.disconnect();
-      checks.typingNeverHidesPopup = typingHiddenMutations === 0;
+      checks.scrollMutatesPopupVisibility = typingHiddenMutations > 0;
+
+      const fastReferenceValue = `${manySections}\nUse \\ref{sec:24}`;
+      document.dispatchEvent(new KeyboardEvent("keydown", {
+        key: "ArrowRight",
+        bubbles: true
+      }));
+      sendPreviewSourceAt(fastReferenceValue, fastReferenceValue.length - 1);
+      checks.fastCursorEntryOpensImmediately = !persistentPopup.hidden;
+      checks.widerReferenceMenu = persistentPopup.getBoundingClientRect().width >= 620;
+      sendPreviewSourceAt(fastReferenceValue, 0);
+      checks.fastCursorExitClosesImmediately = persistentPopup.hidden;
+      checks.closedReferenceListDiscardsPreviousContent = persistentPopup.querySelector(
+        ".smarttex-reference-autocomplete-list"
+      )?.childElementCount === 0;
 
       const passed = Object.values(checks).every(Boolean);
       const output = document.querySelector("#reference-autocomplete-test-result");

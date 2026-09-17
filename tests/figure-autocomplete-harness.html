@@ -618,9 +618,15 @@
       window.dispatchEvent(new CustomEvent("smarttex:editor-scroll-state", {
         detail: { active: true, reason: "typing-auto-scroll" }
       }));
-      checks.typingScrollKeepsListAndPreview = Boolean(
-        !popup.hidden &&
-        !document.querySelector("#smarttex-graphic-autocomplete-preview")?.hidden
+      checks.typingScrollHidesListAndPreview = Boolean(
+        popup.hidden &&
+        document.querySelector("#smarttex-graphic-autocomplete-preview")?.hidden
+      );
+      checks.closedFigurePopupsDiscardPreviousContent = Boolean(
+        popup.querySelector(".smarttex-figure-autocomplete-list")?.childElementCount === 0 &&
+        document.querySelector(
+          "#smarttex-graphic-autocomplete-preview .smarttex-graphic-autocomplete-output"
+        )?.childElementCount === 0
       );
       window.dispatchEvent(new CustomEvent("smarttex:editor-scroll-state", {
         detail: { active: false, reason: "settled" }

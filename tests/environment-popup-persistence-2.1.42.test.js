@@ -31,7 +31,7 @@ test("caret moves inside an open environment bypass generic reopen logic", () =>
     content,
     /continuingActivePreview && \(sourceChanged \|\| cursorChanged\)[\s\S]*immediate: !sourceChanged[\s\S]*return;/
   );
-  assert.match(content, /if \(!sourceChanged\)[\s\S]*positionPreviewAtCursor\(\);[\s\S]*return;/);
+  assert.match(content, /if \(!sourceChanged\)[\s\S]*requestAnimationFrame\(\(\) => positionPreviewAtCursor\(\)\);[\s\S]*return;/);
 });
 
 test("cached refreshes preserve popup position and use only cursor-proximity relocation", () => {

@@ -13,6 +13,24 @@ const { chromium } = require(path.join(moduleRoot, "playwright"));
 const executablePath = process.argv[3] || undefined;
 
 const allHarnesses = [
+  { file: "popup-content-reset-harness.html", attribute: "popupContentResetTest" },
+  { file: "click-list-priority-browser-harness.html", attribute: "clickListPriorityTest" },
+  {
+    file: "typing-idle-browser-harness.html",
+    attribute: "typingIdleTest"
+  },
+  {
+    file: "uninterrupted-preview-browser-harness.html",
+    attribute: "uninterruptedPreviewTest"
+  },
+  {
+    file: "cursor-highlight-browser-harness.html",
+    attribute: "cursorHighlightTest"
+  },
+  {
+    file: "keyboard-preview-browser-harness.html",
+    attribute: "keyboardPreviewTest"
+  },
   {
     file: "citation-bridge-harness.html",
     attribute: "citationBridgeTest"
@@ -130,7 +148,7 @@ async function run() {
     for (const harness of harnesses) {
       const page = await browser.newPage({ viewport: { width: 1440, height: 940 } });
       const errors = [];
-      page.on("pageerror", (error) => errors.push(error.message));
+      page.on("pageerror", (error) => errors.push(error.stack || error.message));
       await page.goto(pathToFileURL(path.join(__dirname, harness.file)).href);
       await page.waitForFunction(
         (attribute) => (
@@ -144,7 +162,7 @@ async function run() {
         harness.attribute
       );
       const output = await page.locator(
-        "output[id$='test-result']"
+        "output[id$='test-result'], output#result"
       ).first().textContent().catch(() => "");
       const passed = result === "passed" && errors.length === 0;
       failed ||= !passed;

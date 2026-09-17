@@ -29,9 +29,9 @@ test("caption typing updates the mounted float and does not fall through to the 
   assert.match(content, /advanceActiveEnvironmentRangeForSourceEdit\(currentState\);/);
 });
 
-test("active environment editor auto-scroll remains mounted and uses only the cursor safety relocation rule", () => {
-  assert.match(content, /const activeEnvironmentEdit = activeEnvironmentPreviewContainsState\(currentState\);/);
-  assert.match(content, /activeCaptionEdit \|\|[\s\S]*activeEquationEdit \|\|[\s\S]*activeEnvironmentEdit \|\|/);
+test("active environment overlays stay mounted but perform no work during editor scrolling", () => {
+  assert.match(content, /event\?\.detail\?\.active === true[\s\S]*popupsSuppressedAfterEditorScroll = true;[\s\S]*return;/);
+  assert.doesNotMatch(content, /event\?\.detail\?\.active === true[\s\S]{0,300}positionPreviewAtCursor/);
   assert.match(content, /if \(!force && previewPositioned && !popupTooCloseToCursor\)[\s\S]*return;/);
 });
 

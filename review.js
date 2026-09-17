@@ -101,6 +101,8 @@
   let reviewState = emptyReviewState();
   let activeChangeId = "";
   let activeChangePopupRequest = 0;
+  let lastReviewStateFingerprint = "";
+  let overlayIdleTimer = 0;
   // During page reload CollabTeX can expose the editor before the selected
   // document has been hydrated. In that short window getState() may report an
   // empty buffer. Never diff such a bootstrap snapshot against the real
@@ -308,6 +310,9 @@
       changes
     };
     globalThis.__smartTeXReviewState = detail;
+    const fingerprint = JSON.stringify(detail);
+    if (fingerprint === lastReviewStateFingerprint) return;
+    lastReviewStateFingerprint = fingerprint;
     window.dispatchEvent(new CustomEvent(REVIEW_STATE_EVENT, { detail }));
   }
 
@@ -1588,6 +1593,7 @@
     if (!next || typeof next !== "object") return;
     const fileName = String(next.fileName || "");
     const nextValue = String(next.value || "");
+    const fileChanged = Boolean(currentFile) && currentFile !== fileName;
     currentState = next;
     currentFile = fileName;
     if (trackingEnabled()) {
@@ -1608,7 +1614,8 @@
     }
 
     const previous = lastValueByFile.get(fileName);
-    if (previous !== nextValue) {
+    const sourceChanged = previous !== nextValue;
+    if (sourceChanged) {
       const splice = singleSplice(previous, nextValue);
       if (splice) {
         const suppressed = suppressedTargetValue !== null && nextValue === suppressedTargetValue;
@@ -1730,12 +1737,10 @@
           }
         }
       }
-    } else {
-      scheduleOverlayRender();
-      updateSelectionPopup();
-    }
+    } else updateSelectionPopup();
+    if (fileChanged) scheduleOverlayRender();
     updateCursorChange();
-    dispatchReviewState();
+    if (sourceChanged || fileChanged) dispatchReviewState();
   }
 
   window.addEventListener(STATE_EVENT, (event) => {
@@ -2691,9 +2696,20 @@
   }
 
   function scheduleOverlayRender() {
+    if (interactionTasks?.isScrolling?.()) return;
+    const idleDelay = Math.max(0, Number(interactionTasks?.keyboardIdleRemaining?.()) || 0);
+    if (idleDelay > 0) {
+      if (overlayIdleTimer) return;
+      overlayIdleTimer = window.setTimeout(() => {
+        overlayIdleTimer = 0;
+        scheduleOverlayRender();
+      }, idleDelay);
+      return;
+    }
     if (overlayFrame) return;
     overlayFrame = window.requestAnimationFrame(() => {
       overlayFrame = 0;
+      if (interactionTasks?.isScrolling?.()) return;
       renderOverlays().catch(() => {});
     });
   }
@@ -3294,6 +3310,16 @@
     updateCursorChange();
   }, { passive: true });
   window.addEventListener("scroll", scheduleOverlayRender, true);
+  window.addEventListener("smarttex:editor-scroll-state", (event) => {
+    if (event?.detail?.active === true) {
+      overlayGeneration += 1;
+      if (overlayFrame) window.cancelAnimationFrame(overlayFrame);
+      overlayFrame = 0;
+      hideChangePopup();
+      return;
+    }
+    scheduleOverlayRender();
+  });
 
   presenceExpiryTimer = window.setInterval(() => {
     const cutoff = Date.now() - 12000;
@@ -3313,6 +3339,7 @@
     window.clearInterval(projectPollTimer);
     window.clearInterval(presenceExpiryTimer);
     if (overlayFrame) cancelAnimationFrame(overlayFrame);
+    window.clearTimeout(overlayIdleTimer);
     uiObserver.disconnect();
     commentHighlightLayer?.remove();
     markupLayer?.remove();

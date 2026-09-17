@@ -9,9 +9,9 @@
   const KEYBOARD_IDLE_EVENT = "smarttex:keyboard-idle";
   const SCROLL_STATE_EVENT = "smarttex:editor-scroll-state";
   const SCROLLING_CLASS = "smarttex-editor-scrolling";
+  const SCROLL_IDLE_MS = 500;
   const KEYBOARD_IDLE_MS = 500;
   const KEYBOARD_TRANSACTION_MS = 120;
-  const FOCUSED_SYNC_SOURCE_LIMIT = 20000;
   const SMARTTEX_SCROLLABLE_SELECTOR = [
     "#smarttex-reference-autocomplete-popup",
     "#smarttex-citation-popup",
@@ -34,6 +34,7 @@
     ".cm-content",
     "[data-smarttex-editor-surface]"
   ].join(",");
+  const SIDEBAR_SELECTOR = "aside,[role='complementary'],.sidebar,.file-tree-list,.outline-pane,#smarttex-comments-pane,#smarttex-review-pane,[data-smarttex-sidebar]";
   const activeTasks = [];
   const subscribers = new Set();
   const scheduledTimeouts = new Map();
@@ -42,10 +43,15 @@
   let lastReason = "initial";
   let nextScheduledId = 1;
   let scrollSettleTimer = 0;
+  let continuousCancellationResetTimer = 0;
   let scrollActive = false;
-  let lastKeyboardActivityAt = -Infinity;
+  let pointerActive = false;
+  let continuousInteractionCancelled = false;
+  let keyboardIdleDeadline = -Infinity;
   let lastKeyboardSubscriberAt = -Infinity;
   let keyboardSettleTimer = 0;
+  let deferredNotificationTimer = 0;
+  let deferredNotificationDetail = null;
   let cachedEditorStateText = "";
   let cachedEditorState = null;
   const rememberedScrollPositions = new WeakMap();
@@ -140,7 +146,10 @@
   function emitScrollState(active, reason = "scroll") {
     try {
       global.dispatchEvent?.(new CustomEvent(SCROLL_STATE_EVENT, {
-        detail: Object.freeze({ active: Boolean(active), reason: String(reason || "scroll") })
+        detail: Object.freeze({
+          active: Boolean(active),
+          reason: String(reason || "scroll")
+        })
       }));
     } catch (_error) {
       // CustomEvent is unavailable in some tests and worker-like environments.
@@ -149,7 +158,10 @@
 
   function finishEditorScroll() {
     scrollSettleTimer = 0;
+    if (continuousCancellationResetTimer) global.clearTimeout?.(continuousCancellationResetTimer);
+    continuousCancellationResetTimer = 0;
     scrollActive = false;
+    continuousInteractionCancelled = false;
     // Keep overlays hidden while subscribers calculate their final geometry.
     // Their requestAnimationFrame callbacks are queued before the class-removal
     // callback below, preventing a one-frame flash at the old position.
@@ -160,6 +172,8 @@
   }
 
   function beginEditorScroll(reason = "scroll") {
+    if (continuousCancellationResetTimer) global.clearTimeout?.(continuousCancellationResetTimer);
+    continuousCancellationResetTimer = 0;
     if (scrollSettleTimer) global.clearTimeout?.(scrollSettleTimer);
     scrollSettleTimer = 0;
     if (!scrollActive) {
@@ -167,7 +181,15 @@
       setScrollingClass(true);
       emitScrollState(true, reason);
     }
-    scrollSettleTimer = global.setTimeout?.(finishEditorScroll, 140) || 0;
+    scrollSettleTimer = global.setTimeout?.(finishEditorScroll, SCROLL_IDLE_MS) || 0;
+  }
+
+  function resetContinuousCancellationAfterIdle() {
+    if (continuousCancellationResetTimer) global.clearTimeout?.(continuousCancellationResetTimer);
+    continuousCancellationResetTimer = global.setTimeout?.(() => {
+      continuousCancellationResetTimer = 0;
+      if (!scrollActive) continuousInteractionCancelled = false;
+    }, SCROLL_IDLE_MS) || 0;
   }
 
   function abortError(reason = "User interaction") {
@@ -188,7 +210,7 @@
   }
 
   function keyboardIdleRemaining() {
-    return Math.max(0, KEYBOARD_IDLE_MS - (Date.now() - lastKeyboardActivityAt));
+    return Math.max(0, keyboardIdleDeadline - Date.now());
   }
 
   function setKeyboardTyping(active) {
@@ -197,6 +219,7 @@
       if (!root) return;
       if (active) {
         if (root.getAttribute("data-smarttex-editor-typing") !== "true") {
+          root.setAttribute("data-smarttex-source-overlays-pending", "true");
           root.setAttribute("data-smarttex-editor-typing", "true");
         }
       } else if (root.hasAttribute("data-smarttex-editor-typing")) {
@@ -220,17 +243,20 @@
     } catch (_error) {}
   }
 
-  function noteKeyboardActivity(now = Date.now()) {
-    lastKeyboardActivityAt = now;
-    setKeyboardTyping(true);
+  function noteKeyboardActivity(now = Date.now(), hideDecorations = true) {
+    // Navigation needs a short settled-state retry, while actual edits retain
+    // the full typing debounce. Moving the caret must not shorten a pending edit.
+    const idleMs = hideDecorations ? KEYBOARD_IDLE_MS : KEYBOARD_TRANSACTION_MS;
+    keyboardIdleDeadline = Math.max(keyboardIdleDeadline, now + idleMs);
+    if (hideDecorations) setKeyboardTyping(true);
     if (keyboardSettleTimer) global.clearTimeout?.(keyboardSettleTimer);
-    keyboardSettleTimer = global.setTimeout?.(finishKeyboardActivity, KEYBOARD_IDLE_MS) || 0;
+    keyboardSettleTimer = global.setTimeout?.(finishKeyboardActivity, keyboardIdleRemaining()) || 0;
   }
 
   function endKeyboardActivity() {
     if (keyboardSettleTimer) global.clearTimeout?.(keyboardSettleTimer);
     keyboardSettleTimer = 0;
-    lastKeyboardActivityAt = -Infinity;
+    keyboardIdleDeadline = -Infinity;
     setKeyboardTyping(false);
   }
 
@@ -249,14 +275,16 @@
   }
 
   function canRunLongTask(state, sourceLength = 0) {
-    if (keyboardIdleRemaining() > 0 || pendingUserInput()) return false;
+    if (pointerActive || scrollActive || keyboardIdleRemaining() > 0 || pendingUserInput()) return false;
     return true;
   }
 
   function canRunBackgroundTask(state, sourceLength = 0) {
     if (!canRunLongTask(state, sourceLength)) return false;
-    if (state?.focused === false) return true;
-    return Math.max(0, Number(sourceLength) || 0) <= FOCUSED_SYNC_SOURCE_LIMIT;
+    // Large focused documents need the proactive cache most. Callers already
+    // enter through an idle callback and yield between individual entries, so
+    // document length must not disable the cache completely.
+    return true;
   }
 
   function closestEditorSurface(target) {
@@ -272,6 +300,7 @@
     if (!documentRef) return true;
     const continuous = ["wheel", "scroll", "touchmove"].includes(event?.type);
     const target = event?.target;
+    if (event?.type === "pointerdown" && target?.closest?.(SIDEBAR_SELECTOR)) return true;
     if (
       continuous &&
       typeof target?.closest === "function" &&
@@ -280,6 +309,7 @@
     if (closestEditorSurface(target)) return true;
     if (typeof event?.composedPath === "function") {
       for (const node of event.composedPath()) {
+        if (event?.type === "pointerdown" && node?.closest?.(SIDEBAR_SELECTOR)) return true;
         if (
           continuous &&
           typeof node?.closest === "function" &&
@@ -308,17 +338,7 @@
     }
   }
 
-  function notify(reason, originalEvent = null, { notifySubscribers = true } = {}) {
-    generation += 1;
-    lastReason = String(reason || "user-activity");
-    for (const task of activeTasks) task.aborted = true;
-    cancelScheduledWork();
-    if (!notifySubscribers) return;
-    const detail = Object.freeze({
-      generation,
-      reason: lastReason,
-      eventType: String(originalEvent?.type || "")
-    });
+  function dispatchNotification(detail) {
     for (const callback of [...subscribers]) {
       try {
         callback(detail);
@@ -333,7 +353,64 @@
     }
   }
 
+  function flushDeferredNotification(afterPointer = false) {
+    deferredNotificationTimer = 0;
+    const pending = deferredNotificationDetail;
+    if (pointerActive && pending?.reason === "pointer") return;
+    if (pending?.reason === "pointer" && !afterPointer) {
+      scheduleDeferredNotification(true);
+      return;
+    }
+    deferredNotificationDetail = null;
+    if (pending) dispatchNotification(pending);
+  }
+
+  function scheduleDeferredNotification(afterPointer = false) {
+    if (deferredNotificationTimer) return;
+    deferredNotificationTimer = 1;
+    if (!afterPointer && typeof global.queueMicrotask === "function") global.queueMicrotask(flushDeferredNotification);
+    else deferredNotificationTimer = global.setTimeout(() => flushDeferredNotification(afterPointer), 0);
+  }
+
+  function releasePointerActivity() {
+    if (!pointerActive) return;
+    pointerActive = false;
+    // The bridge publishes the committed caret/popup transaction in a microtask
+    // before this next task fans cancellation out to background subscribers.
+    if (deferredNotificationDetail?.reason === "pointer") scheduleDeferredNotification(true);
+  }
+
+  function notify(reason, originalEvent = null, {
+    notifySubscribers = true,
+    deferSubscribers = false
+  } = {}) {
+    generation += 1;
+    lastReason = String(reason || "user-activity");
+    const keyboardCancellation = lastReason === "keyboard" || lastReason === "cursor";
+    for (const task of activeTasks) {
+      if (keyboardCancellation && task.surviveKeyboard) task.keyboardInterrupted = true;
+      else task.aborted = true;
+    }
+    cancelScheduledWork();
+    if (!notifySubscribers) return;
+    const detail = Object.freeze({
+      generation,
+      reason: lastReason,
+      eventType: String(originalEvent?.type || "")
+    });
+    if (deferSubscribers && global.document && typeof global.setTimeout === "function") {
+      deferredNotificationDetail = detail;
+      if (!pointerActive || lastReason !== "pointer") scheduleDeferredNotification();
+      return;
+    }
+    dispatchNotification(detail);
+  }
+
   function eventReason(event) {
+    if (event?.type === "keydown" && !event.isComposing && [
+      "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End", "PageUp", "PageDown",
+      "Shift", "Control", "Alt", "Meta", "Escape"
+    ].includes(event.key)) return "cursor";
     if (["keydown", "beforeinput", "input"].includes(event?.type)) return "keyboard";
     if (event?.type === "pointerdown") return "pointer";
     if (event?.type === "wheel") return "wheel";
@@ -346,9 +423,12 @@
     if (!eventBelongsToEditor(event)) return;
     const reason = eventReason(event);
     let notifySubscribers = true;
-    if (reason === "keyboard") {
+    if (reason === "keyboard" || reason === "cursor") {
       const now = Date.now();
-      noteKeyboardActivity(now);
+      // Navigation still needs the settled-keyboard state transaction: an
+      // immediate preview can be cancelled while the host processes the key.
+      // Only text input hides decorations; cursor keys retain mounted highlights.
+      noteKeyboardActivity(now, reason !== "cursor");
       // A normal edit produces keydown, beforeinput, and input in quick
       // succession. Invalidating shared tasks on all three preserves immediate
       // cancellation, but the module subscriber fan-out only needs to happen
@@ -358,7 +438,15 @@
         now - lastKeyboardSubscriberAt > KEYBOARD_TRANSACTION_MS;
       if (notifySubscribers) lastKeyboardSubscriberAt = now;
     }
-    if (reason === "pointer") endKeyboardActivity();
+    if (reason === "pointer") {
+      pointerActive = true;
+      endKeyboardActivity();
+      if (scrollActive) {
+        global.clearTimeout?.(scrollSettleTimer);
+        finishEditorScroll();
+        setScrollingClass(false);
+      }
+    }
 
     // Keyboard, wheel and touch events only establish a before-movement baseline
     // and cancel background work. They must not hide overlays by themselves.
@@ -366,17 +454,28 @@
     // scrollTop/scrollLeft actually changed. This also covers automatic editor
     // scrolling when typing moves the caret outside the current viewport.
     if (reason !== "scroll" && reason !== "keyboard") rememberPotentialEditorScroll(event);
+    if (reason === "wheel" || reason === "touch-scroll") {
+      const notifySubscribers = !continuousInteractionCancelled;
+      continuousInteractionCancelled = true;
+      notify(reason, event, { notifySubscribers });
+      resetContinuousCancellationAfterIdle();
+      return;
+    }
     if (reason === "scroll") {
-      if (!scrollPositionChanged(event)) {
-        notify(reason, event);
-        return;
-      }
+      if (!scrollPositionChanged(event)) return;
       beginEditorScroll(reason);
+      const notifySubscribers = !continuousInteractionCancelled;
+      continuousInteractionCancelled = true;
+      notify(reason, event, { notifySubscribers });
+      return;
     }
 
     // This handler never prevents default or stops propagation. It only invalidates
     // SmartTeX work, allowing the host editor to process the event immediately.
-    notify(reason, event, { notifySubscribers });
+    notify(reason, event, {
+      notifySubscribers,
+      deferSubscribers: ["cursor", "pointer"].includes(reason)
+    });
   }
 
   for (const type of ["keydown", "beforeinput", "input", "pointerdown", "wheel", "scroll", "touchmove"]) {
@@ -385,12 +484,18 @@
       passive: type === "wheel" || type === "scroll" || type === "touchmove"
     });
   }
+  for (const type of ["pointerup", "pointercancel", "blur"]) {
+    global.addEventListener?.(type, releasePointerActivity, { capture: true });
+  }
 
-  function begin(label) {
+  function begin(label, { isCurrent = null, surviveKeyboard = false } = {}) {
     const token = {
       label: String(label || "smarttex-task"),
       generation,
-      aborted: false,
+      aborted: scrollActive || pointerActive,
+      isCurrent: typeof isCurrent === "function" ? isCurrent : null,
+      surviveKeyboard: Boolean(surviveKeyboard),
+      keyboardInterrupted: false,
       checkpointCalls: 0
     };
     activeTasks.push(token);
@@ -404,6 +509,18 @@
 
   function shouldAbort(token = activeTasks[activeTasks.length - 1]) {
     if (!token) return false;
+    if (scrollActive || pointerActive) {
+      token.aborted = true;
+      return true;
+    }
+    if (token.isCurrent) {
+      if (token.aborted || !token.isCurrent()) return true;
+      if (!token.surviveKeyboard && pendingUserInput()) {
+        notify("pending-input");
+        return true;
+      }
+      return false;
+    }
     if (token.aborted || token.generation !== generation) return true;
     if (!pendingUserInput()) return false;
     notify("pending-input");
@@ -412,6 +529,19 @@
 
   function checkpoint(_iteration = 0, interval = 256, token = activeTasks[activeTasks.length - 1]) {
     if (!token) return;
+    // An async task can resume underneath a different suspended task. Restore
+    // its scope so nested parser checkpoints use the resumed task's policy.
+    if (activeTasks[activeTasks.length - 1] !== token) {
+      const index = activeTasks.indexOf(token);
+      if (index >= 0) {
+        activeTasks.splice(index, 1);
+        activeTasks.push(token);
+      }
+    }
+    if (token.isCurrent) {
+      if (shouldAbort(token)) throw abortError("environment-exit");
+      return;
+    }
     if (token.aborted || token.generation !== generation) throw abortError(lastReason);
     token.checkpointCalls = (Number(token.checkpointCalls) || 0) + 1;
     const requestedInterval = Math.max(1, Number(interval) || 1);
@@ -489,6 +619,7 @@
     eventName: ACTIVITY_EVENT,
     keyboardIdleEventName: KEYBOARD_IDLE_EVENT,
     scrollStateEventName: SCROLL_STATE_EVENT,
+    scrollIdleMs: SCROLL_IDLE_MS,
     keyboardIdleMs: KEYBOARD_IDLE_MS,
     keyboardIdleRemaining,
     endKeyboardActivity,

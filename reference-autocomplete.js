@@ -17,7 +17,9 @@
   const initializeWhenDependenciesAreReady = async () => {
     const startedAt = Date.now();
     let repairRequested = false;
-    while (!(globalThis.SmartTeXLatexContext?.referenceTarget && globalThis.SmartTeXLatexContext?.maskIgnoredLatex)) {
+    while (!(globalThis.SmartTeXLatexContext?.referenceTarget &&
+        globalThis.SmartTeXLatexContext?.maskIgnoredLatex &&
+        globalThis.SmartTeXTableRenderer?.renderInlineLatex && globalThis.katex?.render)) {
       if (!repairRequested) {
         repairRequested = true;
         try {
@@ -37,6 +39,7 @@
     globalThis.__smartTeXReferenceAutocompleteLoading = false;
 
   const STATE_EVENT = "smarttex:editor-state";
+  const PREVIEW_STATE_EVENT = "smarttex:preview-editor-state";
   const REQUEST_EVENT = "smarttex:citation-editor-request";
   const RESPONSE_EVENT = "smarttex:citation-editor-response";
   const PREVIEW_EVENT = "smarttex:reference-autocomplete-preview";
@@ -68,6 +71,8 @@
   }
   const extensionApi = globalThis.browser ?? globalThis.chrome;
   const contextTools = globalThis.SmartTeXLatexContext;
+  const tableRenderer = globalThis.SmartTeXTableRenderer;
+  const katex = globalThis.katex;
   const interactionTasks = globalThis.SmartTeXInteractionTasks;
   const popupInteractionReady = () => globalThis.SmartTeXPopupGate?.isReady?.() !== false;
 
@@ -84,6 +89,7 @@
   let dismissedContextId = "";
   let requestCounter = 0;
   let sourceCache = null;
+  let sourceCacheFileName = "";
   let targetCache = new Map();
   let configuredOrderMode = "document";
   let orderMode = "document";
@@ -97,6 +103,9 @@
   let scrollSuppressed = false;
   let lastTextInputAt = 0;
   let runtimeSettingsOverrideActive = false;
+  let recordIndexWarmTimer = 0;
+  let recordIndexWarmGeneration = 0;
+  let recordIndexWarmSource = null;
   const pendingRequests = new Map();
 
   const popup = document.createElement("aside");
@@ -280,6 +289,8 @@
     clearPopupTimer();
     if (dismiss && currentContext) dismissedContextId = contextId();
     popup.hidden = true;
+    list.replaceChildren();
+    renderedRecords = [];
     lastPopupPosition = null;
     popup.classList.remove("smarttex-reference-autocomplete-visible");
     setBridgeActive(false);
@@ -303,10 +314,13 @@
     ) {
       return null;
     }
-    const masked = (typeof contextTools !== "undefined" && contextTools?.maskIgnoredLatex)
-      ? contextTools.maskIgnoredLatex(state.value)
-      : state.value;
-    const beforeCursor = masked.slice(0, state.cursorIndex);
+    const cursor = Math.max(0, Math.min(state.cursorIndex, state.value.length));
+    const lineStart = state.value.lastIndexOf("\n", Math.max(0, cursor - 1)) + 1;
+    const scanStart = Math.max(lineStart, cursor - 4096);
+    const sourceWindow = state.value.slice(scanStart, cursor);
+    const beforeCursor = (typeof contextTools !== "undefined" && contextTools?.maskIgnoredLatex)
+      ? contextTools.maskIgnoredLatex(sourceWindow)
+      : sourceWindow;
     const match = beforeCursor.match(REFERENCE_COMMAND);
     if (!match) return null;
     const completeMatch = match[0];
@@ -316,7 +330,7 @@
     const beforeFragment = argument.slice(lastComma + 1);
     const leadingWhitespace = beforeFragment.match(/^\s*/)?.[0] || "";
     const fragmentStart = state.cursorIndex - beforeFragment.length + leadingWhitespace.length;
-    const commandStart = beforeCursor.length - completeMatch.length;
+    const commandStart = scanStart + beforeCursor.length - completeMatch.length;
     const anchorIndex = commandStart + completeMatch.lastIndexOf("{");
     const argumentIsClosed = matchingArgumentClose(state.value, anchorIndex) >= state.cursorIndex;
     // Text to the right of the cursor only belongs to the active completion
@@ -381,6 +395,7 @@
         ? interactionTasks.runSync("reference-target-index", calculate)
         : calculate();
       sourceCache = source;
+      sourceCacheFileName = String(currentState?.fileName || "main.tex");
       targetCache = new Map();
       records = nextRecords;
       return true;
@@ -388,6 +403,42 @@
       if (interactionTasks?.isAbortError?.(error)) return false;
       throw error;
     }
+  }
+
+  function scheduleRecordIndexWarm(sourceValue) {
+    const source = String(sourceValue || "");
+    if (!source || source === sourceCache) return;
+    if (recordIndexWarmSource === source && recordIndexWarmTimer) return;
+    window.clearTimeout(recordIndexWarmTimer);
+    recordIndexWarmSource = source;
+    const generation = ++recordIndexWarmGeneration;
+    const delay = Math.max(80, Number(interactionTasks?.keyboardIdleRemaining?.()) || 0);
+    recordIndexWarmTimer = window.setTimeout(() => {
+      recordIndexWarmTimer = 0;
+      const run = () => {
+        if (
+          generation !== recordIndexWarmGeneration ||
+          source !== recordIndexWarmSource ||
+          source !== String(currentState?.value || "")
+        ) return;
+        if (
+          scrollSuppressed ||
+          (interactionTasks?.canRunBackgroundTask &&
+            !interactionTasks.canRunBackgroundTask(currentState, source.length))
+        ) {
+          recordIndexWarmSource = null;
+          scheduleRecordIndexWarm(source);
+          return;
+        }
+        rebuildRecords(source);
+        recordIndexWarmSource = null;
+      };
+      if (typeof window.requestIdleCallback === "function") {
+        window.requestIdleCallback(run, { timeout: 500 });
+      } else {
+        window.setTimeout(run, 0);
+      }
+    }, delay);
   }
 
   function targetFor(record) {
@@ -425,6 +476,38 @@
     const title = String(target?.title || target?.caption || "").trim();
     const primary = number ? `${type} ${number}` : type;
     return title ? `${primary} — ${title}` : primary;
+  }
+
+  function renderTargetDescription(container, target) {
+    const description = targetDescription(target);
+    container.replaceChildren();
+    container.title = description;
+    const title = String(target?.title || "").trim();
+    if (target?.type !== "section" || !title) {
+      container.textContent = description;
+      return;
+    }
+    const type = targetTypeText(target);
+    const number = String(target?.number || "").trim();
+    const primary = number ? `${type} ${number}` : type;
+    try {
+      const prepared = contextTools.prepareDocumentCommands(
+        sourceCache || "",
+        Number(target.sourceIndex) || 0,
+        title
+      );
+      const rendered = tableRenderer.renderInlineLatex(prepared.body, {
+        contextTools,
+        document,
+        katex,
+        macros: prepared.macros,
+        trust: false,
+        sourceOffset: Number(target.sourceIndex) || 0
+      });
+      container.append(`${primary} — `, rendered);
+    } catch (_error) {
+      container.textContent = description;
+    }
   }
 
   function inlineLoadingSpinner(label = "Loading") {
@@ -543,8 +626,7 @@
       renderedRecords[task.index] !== task.entry
     ) return;
     task.entry.target = target;
-    task.description.textContent = targetDescription(target);
-    task.description.title = task.description.textContent;
+    renderTargetDescription(task.description, target);
     if (task.thumbnail?.isConnected) {
       task.thumbnail.replaceWith(equationThumbnail(target));
       fitEquationThumbnails();
@@ -748,6 +830,10 @@
       dispatchPreviewHide({ force: true });
       return;
     }
+    if (selected.target.type === "section") {
+      dispatchPreviewHide({ force: true });
+      return;
+    }
     const generation = ++previewGeneration;
     window.requestAnimationFrame(() => {
       if (generation !== previewGeneration || popup.hidden || item !== selectedItemElement()) return;
@@ -788,6 +874,17 @@
   }
 
   function renderPopupNow() {
+    try {
+      return interactionTasks?.runSync
+        ? interactionTasks.runSync("reference-list-render", renderPopupRows)
+        : renderPopupRows();
+    } catch (error) {
+      if (interactionTasks?.isAbortError?.(error)) return false;
+      throw error;
+    }
+  }
+
+  function renderPopupRows() {
     stopTargetHydration();
     updateViewButton();
     queryLabel.textContent = currentContext?.fragment
@@ -848,8 +945,7 @@
       const description = document.createElement("span");
       description.className = "smarttex-reference-autocomplete-description";
       if (entry.target) {
-        description.textContent = targetDescription(entry.target);
-        description.title = description.textContent;
+        renderTargetDescription(description, entry.target);
       } else {
         description.appendChild(inlineLoadingSpinner("Loading reference details"));
       }
@@ -951,6 +1047,19 @@
     stopTargetHydration();
     const generation = ++listRenderGeneration;
     popup.setAttribute("aria-busy", "true");
+    const cachedPointerOpen = currentState.interactionPriority === "pointer" && sourceCache !== null && sourceCacheFileName === String(currentState.fileName || "main.tex");
+    if (sourceCache === currentState.value || cachedPointerOpen) {
+      if (cachedPointerOpen && sourceCache !== currentState.value) scheduleRecordIndexWarm(currentState.value);
+      try {
+        if (renderPopupNow() === false) scheduleListRenderRetry();
+      } finally {
+        if (generation === listRenderGeneration) {
+          popup.removeAttribute("aria-busy");
+          positionPopup();
+        }
+      }
+      return;
+    }
     // Preserve the existing rows while an open list is being filtered. The
     // loading placeholder is only needed for the initial population.
     if (popup.hidden || !list.children.length) {
@@ -994,7 +1103,7 @@
     const screen = currentState?.screen;
     if (!screen) return;
     const margin = 9;
-    const width = Math.max(1, Math.min(500, window.innerWidth - margin * 2));
+    const width = Math.max(1, Math.min(640, window.innerWidth - margin * 2));
     if (popup.dataset.smarttexUserSized !== "true") popup.style.width = `${width}px`;
     const cursorLeft = Number(screen.pageX) - window.scrollX;
     const cursorTop = Number(screen.pageY) - window.scrollY;
@@ -1127,6 +1236,8 @@
     if (nextId === dismissedContextId) {
       clearPopupTimer();
       popup.hidden = true;
+      list.replaceChildren();
+      renderedRecords = [];
       popup.classList.remove("smarttex-reference-autocomplete-visible");
       setBridgeActive(false);
       dispatchPreviewHide({ force: true });
@@ -1176,6 +1287,35 @@
       hidePopup();
       return;
     }
+    scheduleRecordIndexWarm(currentState?.value);
+    updateFromState();
+  });
+
+  window.addEventListener(PREVIEW_STATE_EVENT, (event) => {
+    try {
+      currentState = interactionTasks?.parseEditorState
+        ? interactionTasks.parseEditorState(event.detail)
+        : JSON.parse(String(event.detail || "null"));
+    } catch (_error) {
+      currentContext = null;
+      hidePopup();
+      return;
+    }
+    if (currentState?.interactionPriority === "pointer") {
+      scrollSuppressed = false;
+      dismissedContextId = "";
+    }
+    if (scrollSuppressed) {
+      hidePopup();
+      return;
+    }
+    if (!findReferenceContext(currentState)) {
+      currentContext = null;
+      dismissedContextId = "";
+      hidePopup();
+      return;
+    }
+    immediateOpenUntil = Date.now() + 500;
     updateFromState();
   });
 
@@ -1267,19 +1407,18 @@
 
   window.addEventListener("resize", positionPopup, { passive: true });
   window.addEventListener("smarttex:editor-scroll-state", (event) => {
-    if (event?.detail?.active !== true) return;
-    if (currentContext && textInputIsRecent()) {
-      scrollSuppressed = false;
-      positionPopup();
+    if (event?.detail?.active === true) {
+      scrollSuppressed = true;
+      hidePopup();
       return;
     }
-    // Keep the list closed for coordinate-only state updates after scrolling.
-    // The next explicit keyboard or pointer interaction may open it again.
-    scrollSuppressed = true;
+    scrollSuppressed = false;
+    scheduleRecordIndexWarm(currentState?.value);
     hidePopup();
   });
   window.addEventListener("scroll", (event) => {
     if (event.target instanceof Node && popup.contains(event.target)) return;
+    if (interactionTasks?.isScrolling?.()) return;
     positionPopup();
   }, true);
 

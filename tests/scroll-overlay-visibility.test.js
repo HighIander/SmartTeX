@@ -13,6 +13,7 @@ const timers = new Map();
 let timerId = 0;
 const classes = new Set();
 const scrollStates = [];
+const attributes = new Map();
 
 const editorTarget = {
   scrollTop: 0,
@@ -37,6 +38,10 @@ const sandbox = {
     activeElement: editorTarget,
     scrollingElement: null,
     documentElement: {
+      getAttribute(name) { return attributes.get(name); },
+      hasAttribute(name) { return attributes.has(name); },
+      setAttribute(name, value) { attributes.set(name, value); },
+      removeAttribute(name) { attributes.delete(name); },
       classList: {
         toggle(name, active) { if (active) classes.add(name); else classes.delete(name); }
       }
@@ -51,7 +56,7 @@ const sandbox = {
     for (const callback of listeners.get(event.type) || []) callback(event);
     return true;
   },
-  setTimeout(callback) { const id = ++timerId; timers.set(id, callback); return id; },
+  setTimeout(callback, delay = 0) { const id = ++timerId; timers.set(id, { callback, delay }); return id; },
   clearTimeout(id) { timers.delete(id); },
   requestAnimationFrame(callback) { callback(); return 1; },
   cancelAnimationFrame() {}
@@ -62,9 +67,9 @@ vm.runInContext(fs.readFileSync(path.join(root, "interaction-tasks.js"), "utf8")
   filename: "interaction-tasks.js"
 });
 
-function emit(type, target = editorTarget) {
+function emit(type, target = editorTarget, details = {}) {
   for (const callback of listeners.get(type) || []) {
-    callback({ type, target, composedPath: () => [target] });
+    callback({ type, target, composedPath: () => [target], ...details });
   }
 }
 
@@ -80,8 +85,30 @@ assert.equal(
   "scrolling inside a SmartTeX popup must not hide or cancel the popup"
 );
 
-// Keyboard input and wheel intent cancel background work, but must not hide UI.
+// Navigation, including extended selections, never starts the typing barrier.
+for (const key of ["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End", "PageUp", "PageDown", "Shift", "Control", "Alt", "Meta"]) {
+  emit("keydown", editorTarget, { key, shiftKey: true });
+  assert.equal(attributes.has("data-smarttex-editor-typing"), false, key);
+  assert.ok(sandbox.SmartTeXInteractionTasks.keyboardIdleRemaining() > 0, key);
+  emit("scroll");
+  assert.equal(classes.has("smarttex-editor-scrolling"), false, key);
+}
+// Cursor-driven horizontal scrolling hides overlays only after displacement.
+emit("keydown", editorTarget, { key: "ArrowRight" });
+editorTarget.scrollLeft = 32;
+emit("scroll");
+assert.equal(classes.has("smarttex-editor-scrolling"), true);
+assert.equal(sandbox.SmartTeXInteractionTasks.scrollIdleMs, 500);
+for (const timer of [...timers.values()]) timer.callback();
+assert.equal(classes.has("smarttex-editor-scrolling"), false);
+
+// Text edits still freeze stale decorations until typing settles.
 emit("keydown");
+assert.equal(attributes.get("data-smarttex-editor-typing"), "true");
+sandbox.SmartTeXInteractionTasks.endKeyboardActivity();
+emit("beforeinput", editorTarget, { inputType: "insertText" });
+assert.equal(attributes.get("data-smarttex-editor-typing"), "true");
+sandbox.SmartTeXInteractionTasks.endKeyboardActivity();
 assert.equal(classes.has("smarttex-editor-scrolling"), false);
 emit("wheel");
 assert.equal(classes.has("smarttex-editor-scrolling"), false);
@@ -92,12 +119,15 @@ assert.equal(classes.has("smarttex-editor-scrolling"), false);
 
 // Only an actual viewport displacement starts the hidden-scroll state.
 editorTarget.scrollTop = 48;
+timers.clear();
 emit("scroll");
 assert.equal(classes.has("smarttex-editor-scrolling"), true);
 assert.equal(sandbox.SmartTeXInteractionTasks.isScrolling(), true);
+assert.equal(sandbox.SmartTeXInteractionTasks.canRunLongTask({}, 0), false);
 assert.equal(scrollStates.at(-1)?.active, true);
+assert.deepEqual([...timers.values()].map((timer) => timer.delay), [500]);
 
-for (const callback of [...timers.values()]) callback();
+for (const timer of [...timers.values()]) timer.callback();
 assert.equal(classes.has("smarttex-editor-scrolling"), false);
 assert.equal(sandbox.SmartTeXInteractionTasks.isScrolling(), false);
 assert.equal(scrollStates.at(-1)?.active, false);
@@ -110,36 +140,36 @@ for (const selector of [
   ".smarttex-document-reference-popup",
   "#smarttex-reference-autocomplete-popup",
   "#smarttex-citation-popup",
-  "#smarttex-figure-autocomplete-popup"
+  "#smarttex-figure-autocomplete-popup",
+  "#smarttex-review-comment-highlights",
+  "#smarttex-review-markup-layer",
+  "#smarttex-collaboration-presence-layer"
 ]) {
   assert.match(css, new RegExp(selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
 }
+assert.match(css, /data-smarttex-source-overlays-pending/);
 
 const content = fs.readFileSync(path.join(root, "content.js"), "utf8");
 assert.match(content, /popupsSuppressedAfterEditorScroll = true/);
-assert.match(content, /Popups are intentionally not restored after scrolling/);
 assert.doesNotMatch(content, /active !== false[\s\S]{0,300}scheduleRender\(\)/);
-for (const file of [
-  "citation-autocomplete.js",
-  "figure-autocomplete.js"
-]) {
+for (const file of ["citation-autocomplete.js", "reference-autocomplete.js"]) {
   const source = fs.readFileSync(path.join(root, file), "utf8");
-  assert.match(
-    source,
-    /editor-scroll-state[\s\S]*currentContext && Date\.now\(\) - lastTextInputAt < 350[\s\S]*scrollSuppressed = true;[\s\S]*hidePopup\(\)/,
-    `${file} must survive typing-driven auto-scroll but hide for ordinary scrolling.`
-  );
+  assert.match(source, /event\?\.detail\?\.active === true[\s\S]*scrollSuppressed = true;[\s\S]*hidePopup\(\);[\s\S]*return;/);
+  assert.match(source, /interactionTasks\?\.isScrolling\?\.\(\)[\s\S]*positionPopup\(\)/);
 }
+const figureAutocomplete = fs.readFileSync(path.join(root, "figure-autocomplete.js"), "utf8");
 assert.match(
-  fs.readFileSync(path.join(root, "reference-autocomplete.js"), "utf8"),
-  /editor-scroll-state[\s\S]*currentContext && textInputIsRecent\(\)[\s\S]*scrollSuppressed = true;[\s\S]*hidePopup\(\)/,
-  "Reference autocomplete must survive typing-driven auto-scroll for its full typing grace period."
+  figureAutocomplete,
+  /event\?\.detail\?\.active === true[\s\S]*scrollSuppressed = true;[\s\S]*hidePopup\(\);[\s\S]*return;[\s\S]*updateFromState\(\)/,
+  "Figure autocomplete must refresh only after scrolling settles."
 );
+assert.match(figureAutocomplete, /interactionTasks\?\.isScrolling\?\.\(\)[\s\S]*positionPopup\(\)/);
 assert.match(
   content,
-  /keepTypingOverlays[\s\S]*popupsSuppressedAfterEditorScroll = false[\s\S]*positionPreview\(\)[\s\S]*popupsSuppressedAfterEditorScroll = true/,
-  "Environment and source-reference popups must survive typing-driven auto-scroll."
+  /active === true[\s\S]*popupsSuppressedAfterEditorScroll = true;[\s\S]*cancelPendingEnvironmentPreviewRender\(\);[\s\S]*hidePreview\(\{ clearDismissal: false, force: true \}\)[\s\S]*return;/,
+  "Scrolling must cancel work and close the environment popup immediately."
 );
 assert.match(fs.readFileSync(path.join(root, "page-bridge.js"), "utf8"), /smarttex:editor-scroll-state/);
+assert.match(fs.readFileSync(path.join(root, "page-bridge.js"), "utf8"), /setSourceOverlaysPending\(true\)/);
 
 console.log("Actual editor-scroll overlay visibility tests passed.");

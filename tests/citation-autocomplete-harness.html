@@ -407,6 +407,9 @@ Text \cite{Klu}
       cursorIndex = 0;
       emitState();
       await waitFor(() => popup.hidden, "Citation popup did not close for placement test");
+      checks.closedCitationListDiscardsPreviousContent = popup.querySelector(
+        ".smarttex-citation-list"
+      )?.childElementCount === 0;
       editorScreen = {
         pageX: 420,
         pageY: window.scrollY + window.innerHeight - 24,

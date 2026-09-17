@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>SmartTeX click list priority browser harness</title><style>.cm-scroller { height:250px; overflow:auto } .cm-content { height:1000px }</style>
+  <link rel="stylesheet" href="../content.css">
+</head>
+<body>
+  <div class="file-tree-list"><div role="treeitem" aria-label="main.tex" aria-selected="true"></div></div>
+  <div id="ide-redesign-panel-source-editor">
+    <div class="cm-editor"><div class="cm-scroller"><div class="cm-content" contenteditable="true"></div></div></div>
+  </div>
+  <output id="result" data-result="running">running</output>
+  <script>
+    let editorText = `\\section{Heading}\\label{sec:heading}\n\\begin{equation}\nx=y\\label{eq:test}\n\\end{equation}\nUse \\ref{sec:heading} and \\cite{Smith2025}.\n${"editor text ".repeat(5000)}`;
+    let cursor = editorText.length;
+    const root = document.querySelector(".cm-editor");
+    const content = document.querySelector(".cm-content");
+    const scroller = document.querySelector(".cm-scroller");
+    function doc() {
+      const source = editorText;
+      const starts = [0];
+      for (let index = 0; index < source.length; index += 1) {
+        if (source[index] === "\n") starts.push(index + 1);
+      }
+      const lineAt = (index) => {
+        const bounded = Math.max(0, Math.min(Number(index) || 0, source.length));
+        let lineIndex = starts.length - 1;
+        while (lineIndex > 0 && starts[lineIndex] > bounded) lineIndex -= 1;
+        const from = starts[lineIndex];
+        const newline = source.indexOf("\n", from);
+        return { number: lineIndex + 1, from, to: newline < 0 ? source.length : newline };
+      };
+      return {
+        length: source.length,
+        lines: starts.length,
+        toString: () => source,
+        sliceString: (from, to) => source.slice(from, to),
+        lineAt,
+        line: (number) => lineAt(starts[Math.max(0, Math.min(starts.length - 1, number - 1))])
+      };
+    }
+    const view = {
+      contentDOM: content,
+      dom: root,
+      scrollDOM: scroller,
+      hasFocus: true,
+      state: { doc: doc(), selection: { main: { head: cursor, anchor: cursor, from: cursor, to: cursor } } },
+      dispatch: () => {},
+      coordsAtPos: () => ({ left: 100, right: 102, top: 100, bottom: 118 }),
+      focus: () => { view.hasFocus = true; }
+    };
+    function updateState() {
+      view.state = { doc: doc(), selection: { main: { head: cursor, anchor: cursor, from: cursor, to: cursor } } };
+    }
+    root.cmView = { view };
+  </script>
+  <script>
+    globalThis.browser = { storage: { local: {
+      async get(key) {
+        return { [key]: key.startsWith('smarttex:citation-cache:') ? { parsedAt: '2026-09-17', records: [{ key: 'Smith2025', title: 'Cached citation', authors: ['Smith'], year: '2025', type: 'article' }], files: ['refs.bib'] } : {} };
+      },
+      async set() {}
+    }, onChanged: { addListener() {} } } };
+    globalThis.SmartTeXPopupGate = { isReady: () => true };
+  </script>
+  <script src="../interaction-tasks.js"></script>
+  <script src="../latex-context.js"></script>
+  <script src="../page-bridge.js"></script>
+  <script src="../vendor/katex/katex.min.js"></script>
+  <script src="../table-renderer.js"></script>
+  <script src="../bibtex-parser.js"></script>
+  <script src="../reference-autocomplete.js"></script>
+  <script src="../citation-autocomplete.js"></script>
+  <script>
+    const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
+    const checks = [];
+    const clickDurations = [];
+    const result = document.querySelector('#result');
+    const check = (name, passed) => { checks.push({ name, passed }); if (!passed) throw new Error(name); };
+    const waitFor = async predicate => {
+      const until = performance.now() + 5000;
+      while (!predicate() && performance.now() < until) await pause(25);
+      check('initial editor and cache readiness', Boolean(predicate()));
+    };
+    (async () => {
+      await waitFor(() => document.querySelector('#smarttex-source-structure-highlights')?.childElementCount);
+      content.focus();
+      await pause(200);
+      const tasks = window.SmartTeXInteractionTasks;
+      const references = document.querySelector('#smarttex-reference-autocomplete-popup');
+      const citations = document.querySelector('#smarttex-citation-popup');
+      const highlights = document.querySelector('#smarttex-source-structure-highlights');
+      const labels = document.querySelector('#smarttex-source-number-badges');
+      const referenceIndex = editorText.indexOf('\\ref{sec:heading}') + 7;
+      const citationIndex = editorText.indexOf('\\cite{Smith2025}') + 9;
+      // Confirm that the source index has actually been populated before
+      // measuring a cached click; idle callbacks are deliberately opportunistic.
+      cursor = referenceIndex;
+      updateState();
+      content.dispatchEvent(new KeyboardEvent('keyup', { key: 'ArrowRight', bubbles: true }));
+      await waitFor(() => !references.hidden && references.querySelector('.smarttex-reference-autocomplete-item'));
+      cursor = editorText.length;
+      updateState();
+      content.dispatchEvent(new KeyboardEvent('keyup', { key: 'ArrowRight', bubbles: true }));
+      await waitFor(() => references.hidden);
+      await pause(160);
+      const highlightNodes = [...highlights.children];
+      const labelNodes = [...labels.children];
+      let fanout = false;
+      const unsubscribe = tasks.subscribe(activity => { if (activity.reason === 'pointer') fanout = true; });
+      async function clickField(index, popup, rowSelector, name) {
+        fanout = false;
+        const token = tasks.begin('running-background-work');
+        const started = performance.now();
+        content.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, button: 0 }));
+        check(name + ' click immediately aborts active work', tasks.shouldAbort(token));
+        cursor = index;
+        updateState();
+        content.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, button: 0 }));
+        await new Promise(resolve => queueMicrotask(resolve));
+        check(name + ' opens populated cached rows in the cursor microtask', !popup.hidden && Boolean(popup.querySelector(rowSelector)));
+        check(name + ' list precedes background subscriber fanout', !fanout);
+        clickDurations.push({ name, ms: performance.now() - started });
+        check(name + ' opens without the typing/scroll idle wait', tasks.keyboardIdleRemaining() === 0 && !tasks.isScrolling());
+        tasks.end(token);
+        await pause(40);
+      }
+      await clickField(referenceIndex, references, '.smarttex-reference-autocomplete-item', 'reference');
+      content.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+      check('escape dismisses reference list', references.hidden);
+      await clickField(referenceIndex, references, '.smarttex-reference-autocomplete-item', 'same-cursor reference reentry');
+      await clickField(citationIndex, citations, '.smarttex-citation-item', 'citation');
+      check('leaving reference field closes its list', references.hidden);
+      content.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+      check('escape dismisses citation list', citations.hidden);
+      await clickField(citationIndex, citations, '.smarttex-citation-item', 'same-cursor citation reentry');
+      check('click list transitions preserve environment highlights', highlightNodes.every((node, index) => highlights.children[index] === node));
+      check('click list transitions preserve environment labels', labelNodes.every((node, index) => labels.children[index] === node));
+      check('leaving the click priority path never adds a typing barrier', document.documentElement.dataset.smarttexEditorTyping !== 'true');
+      scroller.scrollTop = 16;
+      scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
+      await pause(40);
+      check('scroll closes lists', citations.hidden && references.hidden);
+      await clickField(citationIndex, citations, '.smarttex-citation-item', 'citation during scroll settle');
+      check('click ends scroll suppression immediately', !tasks.isScrolling() && getComputedStyle(citations).visibility === 'visible');
+      editorText += 'changed plain text';
+      updateState();
+      await clickField(referenceIndex, references, '.smarttex-reference-autocomplete-item', 'reference with outdated source cache');
+      unsubscribe();
+      document.documentElement.dataset.clickListPriorityTest = 'passed';
+      result.textContent = JSON.stringify({ passed: true, clickDurations, checks });
+    })().catch(error => {
+      document.documentElement.dataset.clickListPriorityTest = 'failed';
+      result.textContent = JSON.stringify({ passed: false, error: error.message, checks });
+    });
+  </script>
+</body>
+</html>

@@ -23,8 +23,10 @@ test("equation parser structural kinds are normalized before popup cache lookup"
   const helper = content.match(/function previewElementKind\(context\) \{[\s\S]*?\n  \}/)?.[0] || "";
   assert.match(helper, /return "equation";/);
 
+  const identityBlock = content.match(/function previewEnvironmentIdentity\(state, context\) \{[\s\S]*?\n  \}/)?.[0] || "";
   const keyBlock = content.match(/function previewBaseCacheKey\(state, context\) \{[\s\S]*?\n  \}/)?.[0] || "";
-  assert.match(keyBlock, /previewElementKind\(context\)/);
+  assert.match(identityBlock, /previewElementKind\(context\)/);
+  assert.match(keyBlock, /previewEnvironmentIdentity\(state, context\)/);
   assert.doesNotMatch(keyBlock, /String\(context\?\.kind/);
 });
 

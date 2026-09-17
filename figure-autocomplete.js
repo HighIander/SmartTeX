@@ -27,6 +27,7 @@
     globalThis.__smartTeXFigureAutocompleteLoading = false;
 
     const STATE_EVENT = "smarttex:editor-state";
+    const PREVIEW_STATE_EVENT = "smarttex:preview-editor-state";
     const REQUEST_EVENT = "smarttex:citation-editor-request";
     const RESPONSE_EVENT = "smarttex:citation-editor-response";
     const SELECTION_EVENT = "smarttex:graphic-autocomplete-selection-change";
@@ -320,9 +321,9 @@
         !/\.(?:tex|ltx)$/i.test(String(state.fileName || "main.tex"))
       ) return null;
       const cursor = Math.max(0, Math.min(state.cursorIndex, state.value.length));
-      const scanStart = Math.max(0, cursor - 4096);
-      const masked = contextTools.maskIgnoredLatex(state.value);
-      const beforeCursor = masked.slice(scanStart, cursor);
+      const lineStart = state.value.lastIndexOf("\n", Math.max(0, cursor - 1)) + 1;
+      const scanStart = Math.max(lineStart, cursor - 4096);
+      const beforeCursor = contextTools.maskIgnoredLatex(state.value.slice(scanStart, cursor));
       const match = beforeCursor.match(/\\includegraphics(?:\s*\[[^\]]*\])?\s*\{([^{}]*)$/i);
       if (!match) return null;
       const beforeFragment = String(match[1] || "");
@@ -898,6 +899,8 @@
       listRenderRetryFrame = null;
       stopThumbnailLoading();
       popup.hidden = true;
+      list.replaceChildren();
+      renderedRecords = [];
       popup.removeAttribute("aria-busy");
       popup.classList.remove("smarttex-figure-autocomplete-visible");
       lastPopupPosition = null;
@@ -1064,6 +1067,26 @@
       updateFromState();
     });
 
+    window.addEventListener(PREVIEW_STATE_EVENT, (event) => {
+      try {
+        currentState = interactionTasks?.parseEditorState
+          ? interactionTasks.parseEditorState(event.detail)
+          : JSON.parse(String(event.detail || "null"));
+      } catch (_error) {
+        currentContext = null;
+        setAutocompleteContextActive(false);
+        hidePopup();
+        return;
+      }
+      if (scrollSuppressed || !findFigureContext(currentState)) {
+        currentContext = null;
+        setAutocompleteContextActive(false);
+        hidePopup();
+        return;
+      }
+      updateFromState();
+    });
+
     interactionTasks?.subscribe?.(() => {
       loadingGeneration += 1;
     });
@@ -1168,14 +1191,6 @@
     window.addEventListener("resize", positionPopup, { passive: true });
     window.addEventListener("smarttex:editor-scroll-state", (event) => {
       if (event?.detail?.active === true) {
-        // CodeMirror/Ace may scroll the editor automatically to keep the caret
-        // visible after a keystroke. That must not tear down autocomplete: the
-        // next editor state filters the existing list in place.
-        if (currentContext && Date.now() - lastTextInputAt < 350) {
-          scrollSuppressed = false;
-          positionPopup();
-          return;
-        }
         scrollSuppressed = true;
         hidePopup();
         return;
@@ -1188,6 +1203,7 @@
     });
     window.addEventListener("scroll", (event) => {
       if (event.target instanceof Node && popup.contains(event.target)) return;
+      if (interactionTasks?.isScrolling?.()) return;
       positionPopup();
     }, true);
 

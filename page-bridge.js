@@ -48,6 +48,7 @@
   globalThis.__smartTeXEditorBridgeLoaded = true;
 
   const STATE_EVENT = "smarttex:editor-state";
+  const PREVIEW_STATE_EVENT = "smarttex:preview-editor-state";
   const CITATION_REQUEST_EVENT = "smarttex:citation-editor-request";
   const CITATION_RESPONSE_EVENT = "smarttex:citation-editor-response";
   const STRUCTURE_ANALYSIS_STATE_EVENT = "smarttex:structure-analysis-state";
@@ -70,6 +71,8 @@
   let scheduledState = false;
   let stateTimer = 0;
   let stateScheduleRevision = 0;
+  let previewStateFrame = 0;
+  let lastPreviewSnapshot = null;
   let pointerStateFrame = 0;
   let pointerStateRevision = 0;
   let pointerSelectionActive = false;
@@ -135,6 +138,8 @@
   let overlayFramePending = false;
   let overlayFrameId = 0;
   let overlayIdleTimer = 0;
+  let lastOverlayScrollPosition = null;
+  let lastStructurePaint = null;
   let editorDiscoveryTimer = 0;
   let structureAnalysisActive =
     document.documentElement.dataset.smarttexStructureAnalysis === "pending";
@@ -157,6 +162,24 @@
 
   function keyboardIdleDelay() {
     return Math.max(0, Number(interactionTasks?.keyboardIdleRemaining?.()) || 0);
+  }
+
+  function textInputIsActive() {
+    return document.documentElement.getAttribute("data-smarttex-editor-typing") === "true";
+  }
+
+  function sourceOverlaysPending() {
+    return document.documentElement.getAttribute(
+      "data-smarttex-source-overlays-pending"
+    ) === "true";
+  }
+
+  function setSourceOverlaysPending(active) {
+    if (active) {
+      document.documentElement.setAttribute("data-smarttex-source-overlays-pending", "true");
+    } else {
+      document.documentElement.removeAttribute("data-smarttex-source-overlays-pending");
+    }
   }
 
   function setStructureAnalysisState(active) {
@@ -488,6 +511,17 @@
     return rect ? { left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom } : null;
   }
 
+  function editorScrollPosition() {
+    const scroller = editorKind === "codemirror"
+      ? (editor?.scrollDOM || editorRootElement()?.querySelector?.(".cm-scroller"))
+      : (editor?.renderer?.scroller || editorRootElement()?.querySelector?.(".ace_scroller"));
+    if (!scroller) return null;
+    const left = Number(scroller.scrollLeft);
+    const top = Number(scroller.scrollTop);
+    if (!Number.isFinite(left) || !Number.isFinite(top)) return null;
+    return { left, top };
+  }
+
   function editorViewportRight() {
     return editorViewportBounds()?.right || null;
   }
@@ -594,6 +628,53 @@
     layer.style.height = `${Math.max(0, Math.round(bounds.bottom - bounds.top))}px`;
   }
 
+  function shiftOverlayChildrenVertically(layer, threshold, delta, resizeCrossing = false) {
+    if (!layer?.isConnected || !Number.isFinite(delta) || Math.abs(delta) < 0.5) return false;
+    let changed = false;
+    for (const child of layer.children) {
+      const top = Number.parseFloat(child.style.top);
+      const height = Number.parseFloat(child.style.height);
+      if (!Number.isFinite(top)) continue;
+      const bottom = top + (Number.isFinite(height) ? height : 0);
+      if (top >= threshold - 0.5) {
+        child.style.top = `${Math.round(top + delta)}px`;
+        changed = true;
+      } else if (resizeCrossing && Number.isFinite(height) && bottom > threshold + 0.5) {
+        child.style.height = `${Math.max(1, Math.round(height + delta))}px`;
+        changed = true;
+      }
+    }
+    return changed;
+  }
+
+  function shiftMountedSourceOverlaysAfterScroll() {
+    const current = editorScrollPosition();
+    if (!current || !lastOverlayScrollPosition) {
+      lastOverlayScrollPosition = current;
+      return false;
+    }
+    const deltaY = current.top - lastOverlayScrollPosition.top;
+    lastOverlayScrollPosition = current;
+    if (!Number.isFinite(deltaY) || Math.abs(deltaY) < 0.5) return false;
+    const highlightsChanged = shiftOverlayChildrenVertically(
+      structureHighlightLayer,
+      -Infinity,
+      -deltaY,
+      false
+    );
+    const badgesChanged = shiftOverlayChildrenVertically(numberBadgeLayer, -Infinity, -deltaY, false);
+    return highlightsChanged || badgesChanged;
+  }
+
+  function finishSourceOverlayPaint() {
+    lastOverlayScrollPosition = editorScrollPosition();
+    if (
+      sourceOverlaysPending() &&
+      lastEditorState &&
+      cachedStructureSource === String(lastEditorState.value || "")
+    ) setSourceOverlaysPending(false);
+  }
+
   function editorRootElement() {
     if (editorKind === "codemirror") {
       return editor?.dom || editor?.contentDOM?.closest?.(".cm-editor") || null;
@@ -632,6 +713,12 @@
     );
     if (semanticSurface) return semanticSurface;
     return element;
+  }
+
+  const SMARTTEX_FLOATING_SELECTOR = "#smarttex-equation-preview,.smarttex-document-reference-popup,#smarttex-reference-autocomplete-popup,#smarttex-citation-popup,#smarttex-figure-autocomplete-popup,#smarttex-structure-hover-preview,#smarttex-review-change-popup,#smarttex-comment-selection-popup,.smarttex-label-guard-dialog,.smarttex-label-guard-preview";
+
+  function isSmartTeXFloatingOverlay(element) {
+    return Boolean(element?.closest?.(SMARTTEX_FLOATING_SELECTOR));
   }
 
   function nativeEditorOverlayRects(bounds) {
@@ -673,6 +760,9 @@
     }
     const result = [];
     for (const element of overlays) {
+      // SmartTeX popups already paint above the source layer. Opening one must
+      // not clip/rebuild the mounted environment rectangles underneath it.
+      if (isSmartTeXFloatingOverlay(element)) continue;
       const style = getComputedStyle(element);
       if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) continue;
       const rect = element.getBoundingClientRect();
@@ -719,6 +809,22 @@
     return pieces;
   }
 
+  function sourceHighlightBackground(highlight, color, normalAlpha, maximumAlpha, active, enabled, multiplier = 1) {
+    const inactiveColor = enabled ? colorWithAlpha(color, normalAlpha) : "transparent";
+    const activeColor = colorWithAlpha(color, activeAlpha(normalAlpha, maximumAlpha, true, enabled, multiplier));
+    return { start: highlight.start, end: highlight.end, inactiveColor, activeColor, color: active ? activeColor : inactiveColor };
+  }
+
+  function updateMountedSourceHighlightActivity(layer, cursorIndex) {
+    for (const child of layer?.children || []) {
+      const activity = child.smarttexSourceHighlight;
+      if (!activity) continue;
+      const active = structureHighlightSettings.activeEnabled !== false && cursorIndex >= activity.start && cursorIndex < activity.end;
+      const color = active ? activity.activeColor : activity.inactiveColor;
+      if (child.style.background !== color) child.style.background = color;
+    }
+  }
+
   function appendHighlightRect(layer, bounds, rect, background, borderRadius, overlayRects) {
     for (const piece of visibleHighlightPieces(rect, overlayRects)) {
       const element = document.createElement("div");
@@ -728,9 +834,10 @@
         `top:${Math.round(piece.top - bounds.top)}px`,
         `width:${Math.max(1, Math.round(piece.right - piece.left))}px`,
         `height:${Math.max(1, Math.round(piece.bottom - piece.top))}px`,
-        `background:${background}`,
+        `background:${typeof background === "object" ? background.color : background}`,
         `border-radius:${borderRadius || "0"}`
       ].join(";");
+      if (typeof background === "object") element.smarttexSourceHighlight = background;
       layer.appendChild(element);
     }
   }
@@ -741,17 +848,46 @@
 
   function renderSourceNumberBadges(state = lastEditorState) {
     if (keyboardIdleDelay() > 0) return false;
+    if (sourceOverlaysPending()) {
+      // The pending flag stays up until a full viewport paint below succeeds.
+      // Reusing the previous key would expose coordinates from before scrolling.
+      lastStructurePaint = null;
+    }
     const layer = ensureNumberBadgeLayer();
     const highlightLayer = ensureStructureHighlightLayer();
     if (!state || !editor || !highlightLayer) return false;
-    const badgeFragment = document.createDocumentFragment();
-    const highlightFragment = document.createDocumentFragment();
     const bounds = editorViewportBounds();
     if (!bounds || !Number.isFinite(bounds.right)) return false;
-    updateOverlayBounds(layer, bounds);
-    updateOverlayBounds(highlightLayer, bounds);
     const nativeOverlayRects = nativeEditorOverlayRects(bounds);
     const cursorIndex = Math.max(0, Number(state.cursorIndex) || 0);
+    // Cursor-only transactions reuse the mounted rectangles. Include actual
+    // source coordinates so scrolling, wrapping and folding still repaint.
+    const positions = new Map();
+    const screenPosition = (index) => {
+      taskCheckpoint(positions.size, 16);
+      if (!positions.has(index)) positions.set(index, editorScreenPosition(index));
+      return positions.get(index);
+    };
+    const paintKey = JSON.stringify([
+      bounds, window.scrollX, window.scrollY, nativeOverlayRects, structureHighlightSettings,
+      cachedStructures.highlights.map((highlight) => [
+        screenPosition(highlight.start), screenPosition(highlight.end),
+        screenPosition(highlight.firstLineEnd ?? highlight.start)
+      ]),
+      cachedStructures.badges.map((badge) => screenPosition(badge.index))
+    ]);
+    if (lastStructurePaint?.structures === cachedStructures &&
+        lastStructurePaint.layer === layer && lastStructurePaint.highlightLayer === highlightLayer &&
+        lastStructurePaint.key === paintKey) {
+      updateMountedSourceHighlightActivity(highlightLayer, cursorIndex);
+      renderCommentOverlays();
+      finishSourceOverlayPaint();
+      return true;
+    }
+    const badgeFragment = document.createDocumentFragment();
+    const highlightFragment = document.createDocumentFragment();
+    updateOverlayBounds(layer, bounds);
+    updateOverlayBounds(highlightLayer, bounds);
 
     for (let highlightIndex = 0; highlightIndex < cachedStructures.highlights.length; highlightIndex += 1) {
       taskCheckpoint(highlightIndex, 16);
@@ -759,9 +895,9 @@
       const active = structureHighlightSettings.activeEnabled !== false &&
         cursorIndex >= Number(highlight.start || 0) &&
         cursorIndex < Number(highlight.end || highlight.start || 0);
-      const start = editorScreenPosition(highlight.start);
-      const end = editorScreenPosition(highlight.end);
-      const firstLineEnd = editorScreenPosition(highlight.firstLineEnd ?? highlight.start);
+      const start = screenPosition(highlight.start);
+      const end = screenPosition(highlight.end);
+      const firstLineEnd = screenPosition(highlight.firstLineEnd ?? highlight.start);
       if (!start || !end || !firstLineEnd) continue;
       const rawTop = start.pageY - window.scrollY;
       const rawBottom = end.pageY - window.scrollY + (end.lineHeight || start.lineHeight || 16);
@@ -772,14 +908,13 @@
       if (highlight.kind === "environment") {
         const bodyEnabled = structureHighlightSettings.environmentEnabled !== false;
         const firstLineEnabled = structureHighlightSettings.environmentFirstLineEnabled !== false;
-        if (!bodyEnabled && !firstLineEnabled && !active) continue;
         const firstLineBottom = Math.min(
           bounds.bottom,
           firstLineEnd.pageY - window.scrollY +
             (firstLineEnd.lineHeight || start.lineHeight || 16)
         );
 
-        if (firstLineBottom < bottom && (bodyEnabled || active)) {
+        if (firstLineBottom < bottom) {
           const bodyColor = bodyEnabled
             ? structureHighlightSettings.environmentColor
             : "#8b949e";
@@ -787,13 +922,13 @@
             highlightFragment,
             bounds,
             { left: bounds.left, top: Math.max(top, firstLineBottom), right: bounds.right, bottom },
-            colorWithAlpha(bodyColor, activeAlpha(0.18, 0.52, active, bodyEnabled, 3)),
+            sourceHighlightBackground(highlight, bodyColor, 0.18, 0.52, active, bodyEnabled, 3),
             "2px",
             nativeOverlayRects
           );
         }
 
-        if (firstLineBottom > top && (firstLineEnabled || active)) {
+        if (firstLineBottom > top) {
           const firstLineColor = firstLineEnabled
             ? structureHighlightSettings.environmentFirstLineColor
             : "#8b949e";
@@ -801,7 +936,7 @@
             highlightFragment,
             bounds,
             { left: bounds.left, top, right: bounds.right, bottom: firstLineBottom },
-            colorWithAlpha(firstLineColor, activeAlpha(0.34, 0.72, active, firstLineEnabled, 3)),
+            sourceHighlightBackground(highlight, firstLineColor, 0.34, 0.72, active, firstLineEnabled, 3),
             "2px",
             nativeOverlayRects
           );
@@ -811,7 +946,6 @@
 
       if (highlight.kind === "section") {
         const categoryEnabled = structureHighlightSettings.sectionEnabled !== false;
-        if (!categoryEnabled && !active) continue;
         const baseColor = categoryEnabled
           ? structureHighlightSettings.sectionColor
           : "#8b949e";
@@ -819,7 +953,7 @@
           highlightFragment,
           bounds,
           { left: bounds.left, top, right: bounds.right, bottom },
-          colorWithAlpha(baseColor, activeAlpha(0.34, 0.72, active, categoryEnabled)),
+          sourceHighlightBackground(highlight, baseColor, 0.34, 0.72, active, categoryEnabled),
           "2px",
           nativeOverlayRects
         );
@@ -829,7 +963,6 @@
       const enabledKey = `${highlight.kind}Enabled`;
       const categoryEnabled = !(enabledKey in structureHighlightSettings) ||
         structureHighlightSettings[enabledKey] !== false;
-      if (!categoryEnabled && !active) continue;
       const baseColor = categoryEnabled
         ? (structureHighlightSettings[`${highlight.kind}Color`] || structureHighlightSettings.environmentColor)
         : "#8b949e";
@@ -851,7 +984,7 @@
               right: endRight,
               bottom: Math.min(bottom, top + startLineHeight)
             },
-            colorWithAlpha(baseColor, activeAlpha(0.34, 0.74, active, categoryEnabled)),
+            sourceHighlightBackground(highlight, baseColor, 0.34, 0.74, active, categoryEnabled),
             "2px",
             nativeOverlayRects
           );
@@ -868,7 +1001,7 @@
             right: bounds.right,
             bottom: Math.min(bounds.bottom, top + startLineHeight)
           },
-          colorWithAlpha(baseColor, activeAlpha(0.34, 0.74, active, categoryEnabled)),
+          sourceHighlightBackground(highlight, baseColor, 0.34, 0.74, active, categoryEnabled),
           "2px",
           nativeOverlayRects
         );
@@ -884,7 +1017,7 @@
               right: bounds.right,
               bottom: Math.min(bounds.bottom, endLineTop)
             },
-            colorWithAlpha(baseColor, activeAlpha(0.24, 0.60, active, categoryEnabled)),
+            sourceHighlightBackground(highlight, baseColor, 0.24, 0.60, active, categoryEnabled),
             "2px",
             nativeOverlayRects
           );
@@ -899,7 +1032,7 @@
             right: endRight,
             bottom: Math.min(bounds.bottom, endLineTop + endLineHeight)
           },
-          colorWithAlpha(baseColor, activeAlpha(0.34, 0.74, active, categoryEnabled)),
+          sourceHighlightBackground(highlight, baseColor, 0.34, 0.74, active, categoryEnabled),
           "2px",
           nativeOverlayRects
         );
@@ -913,7 +1046,7 @@
     for (let badgeIndex = 0; badgeIndex < cachedStructures.badges.length; badgeIndex += 1) {
       taskCheckpoint(badgeIndex, 16);
       const badge = cachedStructures.badges[badgeIndex];
-      const screen = editorScreenPosition(badge.index);
+      const screen = screenPosition(badge.index);
       if (!screen || !Number.isFinite(screen.pageY)) continue;
       const top = screen.pageY - window.scrollY;
       const lineHeight = screen.lineHeight || 16;
@@ -936,7 +1069,9 @@
     taskCheckpoint(0, 1);
     highlightLayer.replaceChildren(highlightFragment);
     layer.replaceChildren(badgeFragment);
+    lastStructurePaint = { structures: cachedStructures, editor, layer, highlightLayer, key: paintKey };
     renderCommentOverlays();
+    finishSourceOverlayPaint();
     return true;
   }
 
@@ -1214,6 +1349,7 @@
   }
 
   function scheduleOverlayRender() {
+    if (interactionTasks?.isScrolling?.()) return;
     const idleDelay = keyboardIdleDelay();
     if (idleDelay > 0) {
       if (overlayIdleTimer) return;
@@ -1228,6 +1364,7 @@
     overlayFrameId = window.requestAnimationFrame(() => {
       overlayFramePending = false;
       overlayFrameId = 0;
+      if (interactionTasks?.isScrolling?.()) return;
       try {
         const painted = interactionTasks?.runSync
           ? interactionTasks.runSync("source-overlay-render", () => renderSourceNumberBadges())
@@ -1259,13 +1396,14 @@
 
   function nodeContainsOccludingOverlay(node) {
     if (!(node instanceof Element)) return false;
+    if (isSmartTeXFloatingOverlay(node)) return false;
     if (node.matches?.(OCCLUDING_OVERLAY_SELECTOR)) return true;
-    return Boolean(node.querySelector?.(OCCLUDING_OVERLAY_SELECTOR));
+    return [...node.querySelectorAll(OCCLUDING_OVERLAY_SELECTOR)].some(element => !isSmartTeXFloatingOverlay(element));
   }
 
   function occludingOverlayMutation(mutation) {
     const target = mutation.target instanceof Element ? mutation.target : mutation.target?.parentElement;
-    if (target?.closest?.(
+    if (isSmartTeXFloatingOverlay(target) || target?.closest?.(
       "#smarttex-source-structure-highlights, #smarttex-source-number-badges"
     )) return false;
     if (mutation.type === "attributes") {
@@ -1300,7 +1438,12 @@
     lastEditorState = state || lastEditorState;
     if (!lastEditorState) return;
     const source = lastEditorState.value;
-    if (source === cachedStructureSource) { scheduleOverlayRender(); return; }
+    if (source === cachedStructureSource) {
+      if (!sourceOverlaysPending() && lastStructurePaint?.structures === cachedStructures && lastStructurePaint.editor === editor) {
+        updateMountedSourceHighlightActivity(structureHighlightLayer, Math.max(0, Number(lastEditorState.cursorIndex) || 0));
+      } else scheduleOverlayRender();
+      return;
+    }
     window.clearTimeout(structureRefreshTimer);
     const update = () => {
       structureRefreshTimer = 0;
@@ -1309,6 +1452,11 @@
       if (interactionTasks?.canRunLongTask &&
           !interactionTasks.canRunLongTask(lastEditorState, sourceAtStart.length)) {
         setStructureAnalysisState(false);
+        window.clearTimeout(structureRefreshTimer);
+        structureRefreshTimer = window.setTimeout(
+          () => refreshStructureCache(lastEditorState, false),
+          Math.max(80, keyboardIdleDelay())
+        );
         return;
       }
       let readyForOverlayPaint = false;
@@ -1341,15 +1489,18 @@
         if (!readyForOverlayPaint) setStructureAnalysisState(false);
       }
     };
-    if (immediate || cachedStructureSource === null) update();
+    if (immediate || cachedStructureSource === null || sourceOverlaysPending()) update();
     else structureRefreshTimer = window.setTimeout(update, 140);
   }
 
-  interactionTasks?.subscribe?.(() => {
-    window.clearTimeout(stateTimer);
-    stateTimer = 0;
-    scheduledState = false;
-    stateScheduleRevision += 1;
+  interactionTasks?.subscribe?.((activity) => {
+    if (activity?.reason !== "pointer") {
+      window.clearTimeout(stateTimer);
+      stateTimer = 0;
+      scheduledState = false;
+      stateScheduleRevision += 1;
+      pointerStateFrame = 0;
+    }
     window.clearTimeout(structureRefreshTimer);
     structureRefreshTimer = 0;
     window.clearTimeout(overlayIdleTimer);
@@ -1359,8 +1510,6 @@
     if (overlayFrameId) window.cancelAnimationFrame(overlayFrameId);
     overlayFrameId = 0;
     overlayFramePending = false;
-    if (pointerStateFrame) window.cancelAnimationFrame(pointerStateFrame);
-    pointerStateFrame = 0;
     // The editor's own input/selection listeners schedule the single post-idle
     // state refresh. Do not create replacement timers inside the capture-phase
     // cancellation path; emitState() also restores any cancelled overlay paint.
@@ -1399,7 +1548,13 @@
   });
 
   window.addEventListener("smarttex:editor-scroll-state", (event) => {
-    if (event?.detail?.active !== false) return;
+    if (event?.detail?.active === true) {
+      setSourceOverlaysPending(true);
+      return;
+    }
+    if (event?.detail?.active !== false || textInputIsActive()) return;
+    // Reconcile scroll geometry only after scrolling and typing have settled.
+    shiftMountedSourceOverlaysAfterScroll();
     scheduleOverlayRender();
     scheduleState();
   });
@@ -1407,8 +1562,7 @@
   window.addEventListener(
     interactionTasks?.keyboardIdleEventName || "smarttex:keyboard-idle",
     () => {
-      // This is the hard end of the typing freeze. Reconcile state and repaint
-      // once, even if a host observer cancelled or omitted its normal callback.
+      // Keep the fade gate closed until the new source and viewport are painted.
       scheduleState();
       scheduleOverlayRender();
     }
@@ -3358,6 +3512,11 @@
     };
   }
 
+  function handleBoundEditorScroll() {
+    if (textInputIsActive() || interactionTasks?.isScrolling?.()) return;
+    scheduleOverlayRender();
+  }
+
   function editorIndexAtCoordinates(clientXValue, clientYValue) {
     if (!editor) return null;
     const clientX = Number(clientXValue) || 0;
@@ -3756,11 +3915,11 @@
     ].join("\n");
   }
 
-  function emitState(expectedRevision = stateScheduleRevision) {
+  function emitState(expectedRevision = stateScheduleRevision, preparedState = null) {
     if (expectedRevision !== stateScheduleRevision) return;
     scheduledState = false;
     stateTimer = 0;
-    const state = getEditorState();
+    const state = preparedState || getEditorState();
     if (!state) return;
     lastFingerprint = stateFingerprint(state);
     lastEditorState = state;
@@ -3771,8 +3930,42 @@
     refreshStructureCache(state);
   }
 
+  function emitPreviewState({ allowDuringTyping = false, state: preparedState = null, priority = "" } = {}) {
+    if (pointerSelectionActive || (!allowDuringTyping && textInputIsActive())) return;
+    const state = preparedState || getEditorState();
+    if (!state) return;
+    const previous = lastPreviewSnapshot;
+    if (!priority && previous && previous.value === state.value &&
+        previous.fileName === state.fileName && previous.cursorIndex === state.cursorIndex &&
+        previous.selectionFrom === state.selectionFrom && previous.selectionTo === state.selectionTo &&
+        previous.focused === state.focused && previous.screen?.pageX === state.screen?.pageX &&
+        previous.screen?.pageY === state.screen?.pageY) return;
+    lastPreviewSnapshot = state;
+    const previewState = priority ? { ...state, interactionPriority: priority } : state;
+    window.dispatchEvent(new CustomEvent(PREVIEW_STATE_EVENT, { detail: JSON.stringify(previewState) }));
+  }
+
+  function schedulePreviewState() {
+    if (previewStateFrame || pointerSelectionActive || textInputIsActive()) return;
+    previewStateFrame = window.requestAnimationFrame(() => {
+      previewStateFrame = 0;
+      emitPreviewState();
+    });
+  }
+
+  function scheduleKeyupState(event) {
+    scheduleState();
+    if (![
+      "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End", "PageUp", "PageDown"
+    ].includes(event?.key)) return;
+    if (previewStateFrame) window.cancelAnimationFrame(previewStateFrame);
+    previewStateFrame = 0;
+    emitPreviewState({ allowDuringTyping: true });
+  }
+
   function scheduleState() {
     if (pointerSelectionActive) return;
+    schedulePreviewState();
     if (scheduledState) return;
     scheduledState = true;
     const revision = ++stateScheduleRevision;
@@ -3791,16 +3984,36 @@
     scheduledState = false;
     pointerStateRevision = ++stateScheduleRevision;
     if (pointerStateFrame) return;
-    pointerStateFrame = window.requestAnimationFrame(() => {
+    pointerStateFrame = 1;
+    queueMicrotask(() => {
       pointerStateFrame = 0;
-      // Pointer-up has completed and CodeMirror/Ace has committed the clicked
-      // caret. This explicit cursor transaction bypasses only the keyboard idle
-      // delay; all expensive downstream work keeps its own normal scheduling.
-      emitState(pointerStateRevision);
+      if (pointerStateRevision !== stateScheduleRevision) return;
+      // The editor has committed the clicked caret. Publish the lightweight
+      // cursor/popup transaction first, then leave the expensive general state
+      // consumers to a later browser task so they cannot delay native feedback.
+      const state = getEditorState();
+      if (!state) return;
+      // A suspended background parser can remain on the shared task stack after
+      // cancellation. Give the cursor/list transaction its own scope so its
+      // small context lookups never inherit that aborted background token.
+      const popupTask = interactionTasks?.begin?.("cursor-popup-state", {
+        isCurrent: () => pointerStateRevision === stateScheduleRevision,
+        surviveKeyboard: true
+      });
+      try {
+        emitPreviewState({ allowDuringTyping: true, state, priority: "pointer" });
+      } finally {
+        if (popupTask) interactionTasks.end(popupTask);
+      }
+      window.setTimeout(() => emitState(pointerStateRevision, state), 0);
     });
   }
 
   document.addEventListener("pointerdown", () => {
+    window.clearTimeout(stateTimer);
+    stateTimer = 0;
+    scheduledState = false;
+    stateScheduleRevision += 1;
     pointerSelectionActive = true;
     interactionTasks?.endKeyboardActivity?.();
   }, true);
@@ -3825,7 +4038,7 @@
     const scroller = view.scrollDOM || root?.querySelector?.(".cm-scroller");
     const events = [
       "input",
-      "keyup",
+      "keydown",
       "focus",
       "blur",
       "paste",
@@ -3835,6 +4048,7 @@
     for (const eventName of events) {
       content?.addEventListener(eventName, scheduleState, true);
     }
+    content?.addEventListener("keyup", scheduleKeyupState, true);
     scroller?.addEventListener("scroll", scheduleOverlayRender, { passive: true });
 
     const selectionListener = () => {
@@ -3858,6 +4072,7 @@
       for (const eventName of events) {
         content?.removeEventListener(eventName, scheduleState, true);
       }
+      content?.removeEventListener("keyup", scheduleKeyupState, true);
       scroller?.removeEventListener("scroll", scheduleOverlayRender);
       document.removeEventListener("selectionchange", selectionListener, true);
       observer.disconnect();

@@ -41,7 +41,7 @@ assert.match(citations, /runSync\(\s*"citation-list-filter"/);
 assert.match(citations, /throwIfGenerationChanged/);
 assert.match(bridge, /runSync\(\s*"structure-highlight-analysis"/);
 assert.match(bridge, /runSync\(\s*"source-overlay-render"/);
-assert.match(content, /begin\?\.\(\s*"popup-preview-render"\)/);
+assert.match(content, /begin\?\.\(\s*"popup-preview-render"(?:,|\))/);
 assert.match(content, /isAbortError\?\.\(error\)/);
 assert.match(toolbar, /runSync\(\s*"toolbar-state-analysis"/);
 assert.match(labelGuard, /runSync\(\s*"label-reference-analysis"/);

@@ -286,6 +286,22 @@ function tableAt(source, marker = "|") {
 }
 
 {
+  const { source, context } = equationAt(String.raw`$\bm{\upsigma}+\upvarepsilon|$`);
+  const prepared = tools.prepareDocumentCommands(source, context.openStart, tools.previewBody(context));
+  assert.equal(prepared.macros["\\upsigma"], String.raw`\mathrm{\sigma}`);
+  assert.equal(prepared.macros["\\upvarepsilon"], String.raw`\mathrm{\varepsilon}`);
+  assert.doesNotThrow(() => katex.renderToString(prepared.body, {
+    throwOnError: true,
+    strict: "ignore",
+    trust: true,
+    macros: {
+      ...prepared.macros,
+      "\\SmartTeXCaret": "\\htmlClass{smarttex-rendered-caret}{\\vphantom{|}}"
+    }
+  }));
+}
+
+{
   const scriptCaret = tools.injectCaret("x^2", 2);
   assert.match(scriptCaret, /x\^\{\\SmartTeXCaret\{\}2\}/);
   const groupCaret = tools.injectCaret("\\frac{a}{b}", 9);

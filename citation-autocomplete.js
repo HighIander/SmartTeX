@@ -9,6 +9,7 @@
   globalThis.__smartTeXCitationAutocompleteLoaded = true;
 
   const STATE_EVENT = "smarttex:editor-state";
+  const PREVIEW_STATE_EVENT = "smarttex:preview-editor-state";
   const REQUEST_EVENT = "smarttex:citation-editor-request";
   const RESPONSE_EVENT = "smarttex:citation-editor-response";
   const REFRESH_REQUEST_EVENT = "smarttex:citation-refresh-request";
@@ -180,6 +181,9 @@
     clearPopupTimer();
     if (dismiss && currentContext) dismissedContextId = contextId();
     popup.hidden = true;
+    list.replaceChildren();
+    renderedRecords = [];
+    setStatus("");
     lastPopupPosition = null;
     popup.classList.remove("smarttex-citation-visible");
     setBridgeActive(false);
@@ -197,14 +201,18 @@
     if (
       !state?.value ||
       !Number.isInteger(state.cursorIndex) ||
+      state.focused === false ||
       !/\.(?:tex|ltx)$/i.test(String(state.fileName || "main.tex"))
     ) {
       return null;
     }
-    const masked = (typeof contextTools !== "undefined" && contextTools?.maskIgnoredLatex)
-      ? contextTools.maskIgnoredLatex(state.value)
-      : state.value;
-    const beforeCursor = masked.slice(0, state.cursorIndex);
+    const cursor = Math.max(0, Math.min(state.cursorIndex, state.value.length));
+    const lineStart = state.value.lastIndexOf("\n", Math.max(0, cursor - 1)) + 1;
+    const scanStart = Math.max(lineStart, cursor - 4096);
+    const sourceWindow = state.value.slice(scanStart, cursor);
+    const beforeCursor = (typeof contextTools !== "undefined" && contextTools?.maskIgnoredLatex)
+      ? contextTools.maskIgnoredLatex(sourceWindow)
+      : sourceWindow;
     const match = beforeCursor.match(CITE_COMMAND);
     if (!match) return null;
     const completeMatch = match[0];
@@ -213,9 +221,9 @@
     const beforeFragment = argument.slice(lastComma + 1);
     const leadingWhitespace = beforeFragment.match(/^\s*/)?.[0] || "";
     const fragmentStart =
-      state.cursorIndex - beforeFragment.length + leadingWhitespace.length;
+      cursor - beforeFragment.length + leadingWhitespace.length;
     const anchorIndex =
-      beforeCursor.length - completeMatch.length + completeMatch.lastIndexOf("{");
+      scanStart + beforeCursor.length - completeMatch.length + completeMatch.lastIndexOf("{");
     const argumentIsClosed = matchingArgumentClose(state.value, anchorIndex) >= state.cursorIndex;
     // Ignore text after the cursor while the citation argument is still open.
     const afterFragment = argumentIsClosed
@@ -622,7 +630,6 @@
     if (
       !popupInteractionReady() ||
       smartCitationsPresent ||
-      parsing ||
       !currentContext ||
       contextId() === dismissedContextId
     ) {
@@ -648,7 +655,6 @@
       hidePopup();
       return;
     }
-    if (parsing) return;
     if (smartCitationsPresent) {
       currentContext = null;
       hidePopup();
@@ -666,6 +672,9 @@
     if (contextId() === dismissedContextId) {
       clearPopupTimer();
       popup.hidden = true;
+      list.replaceChildren();
+      renderedRecords = [];
+      setStatus("");
       popup.classList.remove("smarttex-citation-visible");
       setBridgeActive(false);
       return;
@@ -692,6 +701,7 @@
       ".cm-content, .cm-line, .cm-scroller, .cm-editor, " +
       ".ace_content, .ace_text-layer, .ace_scroller, .ace_editor"
     )) {
+      scrollSuppressed = false;
       immediateOpenUntil = Date.now() + 500;
     }
   }, true);
@@ -968,6 +978,7 @@
 
   interactionTasks?.subscribe?.(() => {
     clearPopupTimer();
+    cancelInitialParseStart();
     window.clearTimeout(backgroundParseTimer);
     backgroundParseTimer = null;
     window.clearTimeout(ownershipRefreshTimer);
@@ -976,23 +987,41 @@
     backgroundLoadParseAttemptedKey = "";
   });
 
+  let initialParseFrame = null;
+  let initialParseTimer = null;
+
+  function cancelInitialParseStart() {
+    if (initialParseFrame !== null) window.cancelAnimationFrame(initialParseFrame);
+    if (initialParseTimer !== null) window.clearTimeout(initialParseTimer);
+    initialParseFrame = null;
+    initialParseTimer = null;
+  }
+
   function maybeStartInitialParse() {
-    if (
-      parsing ||
-      smartCitationsPresent ||
-      !currentContext ||
-      !["unparsed", "empty"].includes(parseState) ||
-      initialParseAttemptedKey === cacheKey
-    ) {
-      return;
-    }
+    if (parsing || smartCitationsPresent || !currentContext || !["unparsed", "empty"].includes(parseState) || initialParseAttemptedKey === cacheKey) return;
     initialParseAttemptedKey = cacheKey;
-    parseBibliography({ showAutocomplete: true }).catch((error) => {
-      parseMessage = error.message || String(error);
-      if (!popup.hidden) {
-        renderPopup();
-        setStatus(parseMessage, true);
-      }
+    const generation = interactionTasks?.generation?.();
+    const owner = contextId();
+    // Populate/reveal the cached list or loading state first. Fresh bibliography
+    // requests begin in a task after the browser has had a paint opportunity.
+    cancelInitialParseStart();
+    initialParseFrame = window.requestAnimationFrame(() => {
+      initialParseFrame = null;
+      initialParseTimer = window.setTimeout(() => {
+        initialParseTimer = null;
+        if (popup.hidden || contextId() !== owner || generation !== interactionTasks?.generation?.()) {
+          initialParseAttemptedKey = "";
+          return;
+        }
+        if (parsing) return;
+        parseBibliography({ showAutocomplete: true }).catch((error) => {
+          parseMessage = error.message || String(error);
+          if (!popup.hidden) {
+            renderPopup();
+            setStatus(parseMessage, true);
+          }
+        });
+      }, 0);
     });
   }
 
@@ -1042,6 +1071,30 @@
     }
   });
 
+  window.addEventListener(PREVIEW_STATE_EVENT, (event) => {
+    try {
+      currentState = interactionTasks?.parseEditorState
+        ? interactionTasks.parseEditorState(event.detail)
+        : JSON.parse(String(event.detail || "null"));
+    } catch (_error) {
+      currentContext = null;
+      hidePopup();
+      return;
+    }
+    if (currentState?.interactionPriority === "pointer") {
+      scrollSuppressed = false;
+      dismissedContextId = "";
+    }
+    if (scrollSuppressed || !findCitationContext(currentState)) {
+      currentContext = null;
+      dismissedContextId = "";
+      hidePopup();
+      return;
+    }
+    immediateOpenUntil = Date.now() + 500;
+    updateFromState();
+  });
+
   refreshButton.addEventListener("mousedown", (event) => event.preventDefault());
   refreshButton.addEventListener("click", () => {
     parseBibliography({ showAutocomplete: true }).catch((error) => {
@@ -1079,7 +1132,7 @@
 
   document.addEventListener("keydown", (event) => {
     scrollSuppressed = false;
-    if (smartCitationsPresent || popup.hidden || parsing) return;
+    if (smartCitationsPresent || popup.hidden) return;
     if (event.key === "Escape") {
       event.preventDefault();
       event.stopImmediatePropagation();
@@ -1137,17 +1190,16 @@
 
   window.addEventListener("resize", positionPopup, { passive: true });
   window.addEventListener("smarttex:editor-scroll-state", (event) => {
-    if (event?.detail?.active !== true) return;
-    if (currentContext && Date.now() - lastTextInputAt < 350) {
-      scrollSuppressed = false;
-      positionPopup();
+    if (event?.detail?.active === true) {
+      scrollSuppressed = true;
+      hidePopup();
       return;
     }
-    scrollSuppressed = true;
     hidePopup();
   });
   window.addEventListener("scroll", (event) => {
     if (event.target instanceof Node && popup.contains(event.target)) return;
+    if (interactionTasks?.isScrolling?.()) return;
     positionPopup();
   }, true);
 

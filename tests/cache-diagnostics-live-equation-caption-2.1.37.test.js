@@ -29,7 +29,7 @@ assert.match(css, /data-preview-kind="table"[^}]*smarttex-float-popup-caption[\s
 assert.match(content, /function liveCaptionTextFromLock\(state\)[\s\S]*cursor >= start[\s\S]*\\uE001/);
 assert.match(content, /captionHasCaret[\s\S]*captionCacheKey = captionHasCaret \? null/);
 assert.match(content, /cursorChanged && captionPreviewIsLocked\(\)[\s\S]*scheduleLiveCaptionUpdate\(currentState, \{ immediate: true \}\)/);
-assert.match(content, /needsFloatCaretRefresh[\s\S]*cachedOpeningRevealed[\s\S]*if \(!needsFloatCaretRefresh\) return/);
+assert.match(content, /cachedExactIsCurrent[\s\S]*needsFloatCaretRefresh[\s\S]*if \(cachedExactIsCurrent && !needsFloatCaretRefresh\) return/);
 assert.match(content, /SmartTeXCaret[\s\S]*smarttex-rendered-caret/);
 
 assert.match(manifest, /"version":\s*"2\.1\.(?:4[5-9]|[5-9]\d|\d{3,})"/);

@@ -95,6 +95,10 @@
   let paneObservedPdfPanel = null;
   let sourceChangeTimer = 0;
   let pendingSourceState = null;
+  let lastScheduledSourceFile = "";
+  let lastScheduledSourceValue = "";
+  let lastTrackChangesRenderFingerprint = "";
+  let lastTrackChangesRenderList = null;
   let lastRemoteProbeToken = null;
   let lastFullRemoteReadAt = 0;
   let confirmationOverlay = null;
@@ -1062,16 +1066,26 @@
   function scheduleEditorSourceChange(state) {
     const fileName = String(state?.fileName || "");
     if (!fileName) return;
-    pendingSourceState = { fileName, value: String(state?.value || "") };
+    const value = String(state?.value || "");
+    if (fileMatches(fileName, lastScheduledSourceFile) && value === lastScheduledSourceValue) return;
+    lastScheduledSourceFile = fileName;
+    lastScheduledSourceValue = value;
+    pendingSourceState = { fileName, value };
     clearTimeout(sourceChangeTimer);
     // Re-anchoring scans the source around changed ranges. Keep it off the
     // immediate typing path and apply it after a short idle period instead.
-    sourceChangeTimer = window.setTimeout(() => {
+    const flushAfterIdle = () => {
+      const idleDelay = Math.max(0, Number(interactionTasks?.keyboardIdleRemaining?.()) || 0);
+      if (idleDelay > 0) {
+        sourceChangeTimer = window.setTimeout(flushAfterIdle, idleDelay);
+        return;
+      }
       flushPendingSourceChange();
       // Source maintenance must not tear down an active comment editor or
       // chooser. The pane refresh is deferred until the interaction ends.
       renderAll({ preserveInteraction: true });
-    }, 700);
+    };
+    sourceChangeTimer = window.setTimeout(flushAfterIdle, 700);
   }
 
   function serializeData(value = data) {
@@ -3815,6 +3829,16 @@
     const changes = Array.isArray(reviewUiState.changes)
       ? reviewUiState.changes.filter(isDisplayableReviewChange)
       : [];
+    const fingerprint = JSON.stringify([
+      reviewUiState.tracking,
+      reviewUiState.markupMode,
+      changes.map((change) => [change.id, change.updatedAt, change.type, change.start, change.end,
+        change.fromStart, change.fromEnd, change.toStart, change.toEnd, change.text,
+        change.originalText, change.authorName, change.resolved])
+    ]);
+    if (list === lastTrackChangesRenderList && fingerprint === lastTrackChangesRenderFingerprint) return;
+    lastTrackChangesRenderList = list;
+    lastTrackChangesRenderFingerprint = fingerprint;
     const count = pane.querySelector(".smarttex-track-change-count");
     if (count) count.textContent = changes.length ? String(changes.length) : "";
     for (const selector of [".smarttex-track-accept-all", ".smarttex-track-reject-all"]) {
@@ -4348,6 +4372,10 @@
     if (selectionPopup) selectionPopup.hidden = true;
   }
 
+  window.addEventListener("smarttex:editor-scroll-state", (event) => {
+    if (event?.detail?.active === true) hideSelectionPopup();
+  });
+
   function scheduleSelectionPopup() {
     const revision = ++selectionPopupRevision;
     const selection = currentSelection();
@@ -4514,8 +4542,9 @@
     const previousFileName = String(currentState?.fileName || "");
     const fileChanged = Boolean(previousFileName) && !fileMatches(previousFileName, state.fileName);
     if (fileChanged) flushPendingSourceChange();
+    const sourceChanged = !currentState || fileChanged || String(currentState.value || "") !== String(state.value || "");
     currentState = state;
-    scheduleEditorSourceChange(state);
+    if (sourceChanged) scheduleEditorSourceChange(state);
     maybeAutoOpenForCurrentDocument();
     const cursorFocus = updateCursorThreadFocus();
     if (pendingNavigation && fileMatches(pendingNavigation.fileName, state.fileName)) {

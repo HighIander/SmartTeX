@@ -1073,7 +1073,9 @@
   }
 
   window.addEventListener("smarttex:editor-scroll-state", (event) => {
-    if (event?.detail?.active === true) closePreviewPopup();
+    closePreviewPopup();
+    if (event?.detail?.active !== false) return;
+    scheduleDialogPlacement();
   });
 
   function closeDialog({ showNext = true } = {}) {
@@ -2198,7 +2200,9 @@
     closeDialog();
   }, true);
   window.addEventListener("resize", scheduleDialogPlacement, { passive: true });
-  window.addEventListener("scroll", scheduleDialogPlacement, { passive: true, capture: true });
+  window.addEventListener("scroll", () => {
+    if (!interactionTasks?.isScrolling?.()) scheduleDialogPlacement();
+  }, { passive: true, capture: true });
 
   globalThis.SmartTeXLabelReferenceGuard = Object.freeze({
     isEnabled: () => enabled,

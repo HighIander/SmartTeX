@@ -17,14 +17,14 @@ test("figure/table exact cache keys ignore irrelevant caret movement", () => {
   assert.match(content, /cursorIndex = -1;[\s\S]*selectionFrom = -1;[\s\S]*selectionTo = -1;/);
 });
 
-test("warm cache reuses markup but revalidates fit against live DOM", () => {
+test("warm cache reuses compatible fitted geometry without repeated layout search", () => {
   assert.match(content, /cachedPreviewMediaReady/);
-  assert.match(content, /applyPreviewAutoFitPolicyNow\(prepared\)/);
+  assert.match(content, /if \(prepared\.cacheCompatible\)/);
+  assert.match(content, /fontSignature: previewFontSignature\(\)/);
   assert.match(content, /cached\.metrics = liveMetrics/);
   assert.match(content, /cached\.metrics = revealed\.metrics/);
-  assert.match(gate, /Always start from cached \*intrinsic\* geometry/);
-  assert.match(gate, /const requestedWidth = scaledNaturalWidth;/);
-  assert.match(gate, /const requestedHeight = scaledNaturalHeight;/);
+  assert.match(gate, /hasCompatibleFittedGeometry[\s\S]*Number\(cached\.finalSize\.width\)/);
+  assert.match(gate, /hasCompatibleFittedGeometry[\s\S]*Number\(cached\.finalSize\.height\)/);
 });
 
 test("outer popup clipping participates in overflow and figure height fitting", () => {

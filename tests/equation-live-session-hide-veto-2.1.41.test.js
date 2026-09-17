@@ -12,11 +12,12 @@ test('live equation edit session vetoes generic popup hides', () => {
   );
 });
 
-test('editor auto-scroll preserves an active equation edit popup', () => {
+test('editor auto-scroll hides the active equation visually and defers all popup work', () => {
   assert.match(
     content,
-    /const activeEquationEdit = liveEquationEditSessionContainsState\(currentState\);[\s\S]*?const keepTypingOverlays = Boolean\([\s\S]*?activeCaptionEdit \|\|[\s\S]*?activeEquationEdit \|\|/
+    /event\?\.detail\?\.active === true[\s\S]*?popupsSuppressedAfterEditorScroll = true;[\s\S]*?return;/
   );
+  assert.doesNotMatch(content, /event\?\.detail\?\.active === true[\s\S]{0,300}positionPreview/);
 });
 
 test('explicit forced close still bypasses the equation edit veto', () => {

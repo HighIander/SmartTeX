@@ -453,12 +453,12 @@
       Math.abs((Number(cached.viewportHeight) || 0) - window.innerHeight) <= 2
     );
 
-    // Fitted cached dimensions are only hints. They can differ subtly from the
-    // current live DOM because of font rasterization, device scale, or a newly
-    // decoded image. Always start from cached *intrinsic* geometry and let the
-    // live fit validator derive the final size exactly as the cold path does.
-    const requestedWidth = scaledNaturalWidth;
-    const requestedHeight = scaledNaturalHeight;
+    const requestedWidth = hasCompatibleFittedGeometry
+      ? Number(cached.finalSize.width)
+      : scaledNaturalWidth;
+    const requestedHeight = hasCompatibleFittedGeometry
+      ? Number(cached.finalSize.height)
+      : scaledNaturalHeight;
 
     resizePopup(popup, state, type, {
       left: popup.getBoundingClientRect().left,

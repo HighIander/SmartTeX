@@ -53,7 +53,8 @@
     let earlyState = false;
     let dispatchDurationMs = 0;
     let typingBarrierDuringInput = false;
-    let typingLayersHidden = false;
+    let typingLayersFadingOut = false;
+    let typingLayerOpacities = [];
     let overlayMutations = 0;
     let overlayMutationsDuringTyping = -1;
     let pointerStartedAt = 0;
@@ -68,7 +69,9 @@
         pointerStateAt = performance.now();
       }
     });
-    window.setTimeout(() => {
+    window.setTimeout(async () => {
+      const readyDeadline = performance.now() + 10000;
+      while ((!document.querySelector("#smarttex-source-structure-highlights") || !document.querySelector("#smarttex-source-number-badges")) && performance.now() < readyDeadline) await new Promise(resolve => setTimeout(resolve, 30));
       content.focus();
       const overlayLayers = [...document.querySelectorAll(
         "#smarttex-source-structure-highlights, #smarttex-source-number-badges"
@@ -88,9 +91,6 @@
         content.dispatchEvent(new InputEvent("input", { inputType: "insertText", data: "z", bubbles: true }));
         lastInputAt = performance.now();
         typingBarrierDuringInput = document.documentElement.dataset.smarttexEditorTyping === "true";
-        typingLayersHidden = overlayLayers.length > 0 && overlayLayers.every((layer) => (
-          getComputedStyle(layer).visibility === "hidden"
-        ));
         dispatchDurationMs = Math.max(dispatchDurationMs, lastInputAt - startedAt);
       };
       sendKey();
@@ -101,12 +101,14 @@
         window.setTimeout(() => {
           earlyState = stateReceivedAt > 0;
           overlayMutationsDuringTyping = overlayMutations;
+          typingLayerOpacities = overlayLayers.map(layer => Number(getComputedStyle(layer).opacity));
+          typingLayersFadingOut = typingLayerOpacities.length > 0 && typingLayerOpacities.every(opacity => opacity < 0.95) && document.documentElement.dataset.smarttexSourceOverlaysPending === "true";
         }, 350);
         window.setTimeout(() => {
           const stateDelayMs = stateReceivedAt ? stateReceivedAt - lastInputAt : -1;
           const typingBarrierAfterIdle = document.documentElement.dataset.smarttexEditorTyping === "true";
           overlayObserver.disconnect();
-          const typingPassed = dispatchDurationMs < 50 && !earlyState && stateDelayMs >= 450 && stateDelayMs < 1000 && stateValue.endsWith("zz") && typingBarrierDuringInput && !typingBarrierAfterIdle && typingLayersHidden && overlayMutationsDuringTyping === 0;
+          const typingPassed = dispatchDurationMs < 50 && !earlyState && stateDelayMs >= 450 && stateDelayMs < 1000 && stateValue.endsWith("zz") && typingBarrierDuringInput && !typingBarrierAfterIdle && typingLayersFadingOut && overlayMutationsDuringTyping === 0;
           content.addEventListener("pointerup", () => {
             cursor = pointerTarget;
             updateState();
@@ -118,8 +120,9 @@
             const pointerStateDelayMs = pointerStateAt ? pointerStateAt - pointerStartedAt : -1;
             const pointerEndedTypingBarrier = window.SmartTeXInteractionTasks?.keyboardIdleRemaining?.() === 0 && document.documentElement.dataset.smarttexEditorTyping !== "true";
             const passed = typingPassed && pointerStateDelayMs >= 0 && pointerStateDelayMs < 100 && pointerEndedTypingBarrier;
-            const detail = { passed, dispatchDurationMs, stateDelayMs, earlyState, sourceLength: stateValue.length, idleRemainingAfterInput, activityReason, typingBarrierDuringInput, typingBarrierAfterIdle, typingLayersHidden, overlayMutationsDuringTyping, pointerStateDelayMs, pointerEndedTypingBarrier };
+            const detail = { passed, dispatchDurationMs, stateDelayMs, earlyState, sourceLength: stateValue.length, idleRemainingAfterInput, activityReason, typingBarrierDuringInput, typingBarrierAfterIdle, typingLayersFadingOut, typingLayerOpacities, overlayMutationsDuringTyping, pointerStateDelayMs, pointerEndedTypingBarrier };
             result.dataset.result = passed ? "passed" : "failed";
+            document.documentElement.dataset.typingIdleTest = passed ? "passed" : "failed";
             result.textContent = JSON.stringify(detail);
           }, 120);
         }, 850);

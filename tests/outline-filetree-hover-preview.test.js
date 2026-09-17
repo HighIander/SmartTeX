@@ -41,7 +41,7 @@ assert.match(content, /document\.addEventListener\("pointerout"/);
 // the viewport. It is noninteractive, so it cannot steal hover/click events.
 assert.match(content, /smarttex-structure-hover-preview-measuring/);
 assert.match(content, /positionStructureHoverPreview\(anchor, popup\)/);
-assert.match(content, /window\.addEventListener\("scroll", \(\) => hideStructureHoverPreview\(\), true\)/);
+assert.match(content, /window\.addEventListener\("scroll", \(\) => \{[\s\S]*?interactionTasks\?\.isScrolling\?\.\(\)[\s\S]*?hideStructureHoverPreview\(\);[\s\S]*?\}, true\)/);
 assert.match(css, /#smarttex-structure-hover-preview\s*\{/);
 assert.match(css, /pointer-events:\s*none/);
 assert.match(css, /smarttex-structure-hover-media-grid/);

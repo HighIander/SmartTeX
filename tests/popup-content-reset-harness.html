@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>SmartTeX popup content reset regression</title>
+  <link rel="stylesheet" href="../vendor/katex/katex.min.css">
+  <link rel="stylesheet" href="../content.css">
+</head>
+<body>
+  <div class="editor-pane"><div class="cm-editor"><div class="cm-content"></div></div></div>
+  <output id="result">running</output>
+  <script>
+    globalThis.SmartTeXPopupGate = { isReady: () => true };
+    globalThis.browser = { storage: { local: { async get() { return {
+      "smarttex:features:v1": { equations: true, tables: true, figures: true },
+      "smarttex:reference-popups:v1": { trigger: "cursor", environmentTrigger: "cursor" }
+    }; } } } };
+    window.addEventListener("smarttex:citation-editor-request", event => {
+      const request = JSON.parse(event.detail);
+      window.dispatchEvent(new CustomEvent("smarttex:citation-editor-response", { detail: JSON.stringify({
+        requestId: request.requestId, ok: true, screen: { pageX: 300, pageY: 200, lineHeight: 20 }
+      }) }));
+    });
+  </script>
+  <script src="../vendor/katex/katex.min.js"></script>
+  <script src="../latex-context.js"></script>
+  <script src="../table-renderer.js"></script>
+  <script src="../figure-renderer.js"></script>
+  <script src="../popup-gate.js"></script>
+  <script src="../content.js"></script>
+  <script>
+    const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
+    const checks = [];
+    const check = (name, passed) => { checks.push({ name, passed }); if (!passed) throw new Error(name); };
+    const waitFor = async (predicate, name) => {
+      const until = performance.now() + 5000;
+      while (!predicate() && performance.now() < until) await pause(10);
+      check(name, Boolean(predicate()));
+    };
+    const first = String.raw`\begin{equation}11111\label{eq:first}\end{equation}`;
+    const second = String.raw`\begin{equation}22222\label{eq:second}\end{equation}`;
+    const sendState = (value, cursorIndex) => window.dispatchEvent(new CustomEvent("smarttex:editor-state", { detail: JSON.stringify({
+      value, cursorIndex, selectionFrom: cursorIndex, selectionTo: cursorIndex,
+      screen: { pageX: 300, pageY: 200, lineHeight: 20 }, fileName: "main.tex", focused: true, editorKind: "harness"
+    }) }));
+    const visible = popup => !popup.hidden && getComputedStyle(popup).visibility === "visible";
+    const showReference = label => window.dispatchEvent(new CustomEvent("smarttex:reference-autocomplete-preview", { detail: JSON.stringify({
+      label, command: "eqref", sourceIndex: 0,
+      anchorRect: { left: 100, right: 200, top: 100, bottom: 125 },
+      ownerRect: { left: 80, right: 250, top: 80, bottom: 250 }
+    }) }));
+    (async () => {
+      const popup = document.querySelector("#smarttex-equation-preview");
+      sendState(first, first.indexOf("11111"));
+      await waitFor(() => visible(popup) && popup.textContent.includes("11111"), "first preview renders");
+      const source = `${first}\n${second}\noutside`;
+      let wrongFrames = 0;
+      const inspect = () => { if (visible(popup) && popup.querySelector(".smarttex-equation-output").textContent.includes("11111")) wrongFrames += 1; };
+      const observer = new MutationObserver(inspect);
+      observer.observe(popup, { childList: true, subtree: true, attributes: true });
+      sendState(source, source.indexOf("22222"));
+      check("different environment clears old content synchronously", popup.hidden && !popup.querySelector(".smarttex-equation-output").textContent);
+      await waitFor(() => visible(popup) && popup.textContent.includes("22222"), "second preview renders");
+      observer.disconnect();
+      check("first environment cannot supply second environment cache frame", wrongFrames === 0);
+      sendState(source, source.length - 1);
+      showReference("eq:first");
+      await waitFor(() => [...document.querySelectorAll(".smarttex-document-reference-popup")].some(node => visible(node) && node.textContent.includes("11111")), "first reference preview opens");
+      const reference = [...document.querySelectorAll(".smarttex-document-reference-popup")].find(visible);
+      showReference("eq:second");
+      check("reference switch clears old preview before next frame", reference.hidden && !reference.textContent);
+      await waitFor(() => visible(reference) && reference.textContent.includes("22222"), "second reference preview opens");
+      sendState(source, source.indexOf("11111"));
+      await waitFor(() => visible(popup) && popup.textContent.includes("11111"), "cached first environment reopens correctly");
+      for (const kind of ["table", "figure"]) {
+        const body = kind === "table" ? String.raw`\begin{tabular}{c}x\end{tabular}` : "";
+        const oldCaption = `Old ${kind} content`;
+        const newCaption = `New ${kind} content`;
+        const oldEnvironment = `\\begin{${kind}}${body}\\caption{${oldCaption}}\\end{${kind}}`;
+        const newEnvironment = `\\begin{${kind}}${body}\\caption{${newCaption}}\\end{${kind}}`;
+        sendState(oldEnvironment, oldEnvironment.indexOf(oldCaption));
+        await waitFor(() => visible(popup) && popup.textContent.includes(oldCaption), `first ${kind} preview renders`);
+        let staleFrames = 0;
+        const tracker = new MutationObserver(() => { if (visible(popup) && popup.textContent.includes(oldCaption)) staleFrames += 1; });
+        tracker.observe(popup, { childList: true, subtree: true, attributes: true });
+        const pair = `${oldEnvironment}\n${newEnvironment}`;
+        sendState(pair, pair.indexOf(newCaption));
+        check(`${kind} switch clears previous output immediately`, popup.hidden && !popup.querySelector(".smarttex-equation-output").textContent);
+        await waitFor(() => visible(popup) && popup.textContent.includes(newCaption), `second ${kind} preview renders`);
+        tracker.disconnect();
+        check(`${kind} never displays another environment's cached content`, staleFrames === 0);
+      }
+      document.documentElement.dataset.popupContentResetTest = "passed";
+      document.querySelector("#result").textContent = JSON.stringify({ passed: true, checks });
+    })().catch(error => {
+      document.documentElement.dataset.popupContentResetTest = "failed";
+      document.querySelector("#result").textContent = JSON.stringify({ passed: false, error: error.message, checks });
+    });
+  </script>
+</body>
+</html>

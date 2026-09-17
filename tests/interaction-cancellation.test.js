@@ -99,6 +99,27 @@ const before = tasks.generation();
 for (const callback of listeners.get("wheel") || []) callback({ type: "wheel" });
 assert.equal(tasks.generation(), before + 1, "wheel input must invalidate active/scheduled work");
 
+const environmentTask = tasks.begin("environment", { isCurrent: () => true });
+for (const callback of listeners.get("keydown") || []) callback({ type: "keydown" });
+assert.throws(
+  () => tasks.checkpoint(0, 1, environmentTask),
+  (error) => tasks.isAbortError(error),
+  "a keypress must cancel in-flight environment rendering"
+);
+tasks.end(environmentTask);
+
+const cachedRevealTask = tasks.begin("cached-preview-reveal", {
+  isCurrent: () => true,
+  surviveKeyboard: true
+});
+for (const callback of listeners.get("keydown") || []) callback({ type: "keydown" });
+assert.doesNotThrow(
+  () => tasks.checkpoint(0, 1, cachedRevealTask),
+  "a cache-only popup reveal may finish across a keypress"
+);
+assert.equal(cachedRevealTask.keyboardInterrupted, true);
+tasks.end(cachedRevealTask);
+
 let subscriberNotifications = 0;
 tasks.subscribe(() => { subscriberNotifications += 1; });
 for (const callback of listeners.get("keydown") || []) callback({ type: "keydown" });
@@ -120,7 +141,7 @@ const secondState = tasks.parseEditorState(stateText);
 assert.notEqual(firstState, secondState, "consumers must receive independent state objects");
 assert.notEqual(firstState.cursor, secondState.cursor);
 assert.equal(tasks.canRunLongTask({ focused: true }, 500000), true);
-assert.equal(tasks.canRunBackgroundTask({ focused: true }, 500000), false);
+assert.equal(tasks.canRunBackgroundTask({ focused: true }, 500000), true);
 assert.equal(tasks.canRunBackgroundTask({ focused: false }, 500000), true);
 
 assert.throws(
@@ -130,5 +151,17 @@ assert.throws(
   }),
   (error) => tasks.isAbortError(error)
 );
+
+for (const callback of listeners.get("keydown") || []) callback({ type: "keydown", key: "ArrowLeft" });
+assert.equal(tasks.keyboardIdleRemaining(), 120, "navigation must retain a short settled-state retry");
+now += 60;
+tasks.cancel("pending-input");
+assert.equal(tasks.keyboardIdleRemaining(), 60, "cancelling preview work must preserve the navigation retry");
+now += 60;
+assert.equal(tasks.isKeyboardIdle(), true);
+for (const callback of listeners.get("input") || []) callback({ type: "input" });
+now += 100;
+for (const callback of listeners.get("keydown") || []) callback({ type: "keydown", key: "ArrowRight" });
+assert.equal(tasks.keyboardIdleRemaining(), 400, "navigation must not shorten the pending text-edit debounce");
 
 console.log("Synchronous analysis cancellation tests passed.");

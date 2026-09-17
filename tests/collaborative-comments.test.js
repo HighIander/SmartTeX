@@ -35,6 +35,9 @@ const read = (name) => fs.readFileSync(path.join(root, name), "utf8");
   assert.match(comments, /deletedAt/, "Collaborative deletion tombstones must be retained for synchronization.");
   assert.match(comments, /function reattachRecord\(/, "Source anchors must support contextual reattachment.");
   assert.match(comments, /function scheduleEditorSourceChange\(/, "Anchor maintenance must stay off the immediate typing path.");
+  assert.match(comments, /if \(sourceChanged\) scheduleEditorSourceChange\(state\)/, "Cursor-only states must not schedule source maintenance.");
+  assert.match(comments, /keyboardIdleRemaining[\s\S]*window\.setTimeout\(flushAfterIdle/, "Source maintenance must recheck the shared typing barrier.");
+  assert.match(comments, /lastTrackChangesRenderFingerprint/, "Unchanged review data must not rebuild all change cards.");
   assert.match(comments, /Minimize all comments/);
   assert.match(comments, /smarttex-comments-close/, "The comments pane must expose a header close button.");
   assert.match(comments, /querySelector\("\.smarttex-comments-close"\)\?\.addEventListener\("click", closePane\)/, "The pane close button must use the same close state as the toolbar toggle.");
@@ -58,6 +61,12 @@ const read = (name) => fs.readFileSync(path.join(root, name), "utf8");
   assert.match(bridge, /appendCommentRange/);
   assert.match(bridge, /smarttex-marker-anchor-icon/);
   assert.match(bridge, /convert-to-comment/);
+  assert.match(bridge, /function scheduleOverlayRender\(\) \{\s*if \(interactionTasks\?\.isScrolling\?\.\(\)\) return;/, "Structure overlays must remain dormant during active scrolling.");
+
+  const review = read("review.js");
+  assert.match(review, /lastReviewStateFingerprint/, "Review state fan-out must be revision-deduplicated.");
+  assert.match(review, /if \(sourceChanged \|\| fileChanged\) dispatchReviewState\(\)/, "Cursor-only states must not republish the complete review list.");
+  assert.match(review, /function scheduleOverlayRender\(\) \{\s*if \(interactionTasks\?\.isScrolling\?\.\(\)\) return;/, "Review overlays must remain dormant during active scrolling.");
 
   const toolbar = read("editor-toolbar.js");
   assert.match(toolbar, /smarttex-comments-toggle-button/);

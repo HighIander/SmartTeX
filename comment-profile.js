@@ -134,12 +134,19 @@
     open.className = "smarttex-fallback-name-notice-link";
     open.textContent = "Open options";
 
+    const reposition = () => {
+      if (globalThis.SmartTeXInteractionTasks?.isScrolling?.()) return;
+      positionFallbackNotice(bubble, anchor);
+    };
+    const repositionAfterScroll = (event) => {
+      if (event?.detail?.active === false) reposition();
+    };
     const cleanup = () => {
       window.removeEventListener("resize", reposition, true);
       window.removeEventListener("scroll", reposition, true);
+      window.removeEventListener("smarttex:editor-scroll-state", repositionAfterScroll);
       bubble.remove();
     };
-    const reposition = () => positionFallbackNotice(bubble, anchor);
     close.addEventListener("click", cleanup);
     open.addEventListener("click", () => {
       cleanup();
@@ -152,6 +159,7 @@
     requestAnimationFrame(reposition);
     window.addEventListener("resize", reposition, true);
     window.addEventListener("scroll", reposition, true);
+    window.addEventListener("smarttex:editor-scroll-state", repositionAfterScroll);
     return true;
   }
 

@@ -2202,7 +2202,7 @@ body.smarttex-figure-autocomplete-context-active .ace_autocomplete_popup {
   z-index: 2147483646;
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
-  width: min(500px, calc(100vw - 18px));
+  width: min(640px, calc(100vw - 18px));
   max-height: min(430px, calc(100vh - 18px));
   overflow: hidden;
   border: 1px solid rgb(111 127 147 / 52%);
@@ -2355,7 +2355,7 @@ body.smarttex-figure-autocomplete-context-active .ace_autocomplete_popup {
 
 .smarttex-reference-autocomplete-item {
   display: grid;
-  grid-template-columns: minmax(120px, 0.9fr) minmax(0, 1.6fr);
+  grid-template-columns: minmax(135px, 0.8fr) minmax(0, 2fr);
   gap: 10px;
   align-items: center;
   width: 100%;
@@ -4217,25 +4217,63 @@ body[data-theme="dark"] .smarttex-figure-zoom-output {
   pointer-events: none;
 }
 
-/* Structural overlays are hidden while the editor viewport moves. Popup
-   visibility is managed in JavaScript so typing-driven auto-scroll can keep an
-   active preview or completion list mounted and update it in place. */
+/* Hide every editor-anchored SmartTeX surface as soon as the viewport moves.
+   JavaScript closes the interactive popups too; this rule prevents even one
+   stale frame while cancellation and DOM cleanup run. */
 html.smarttex-editor-scrolling #smarttex-source-structure-highlights,
 html.smarttex-editor-scrolling #smarttex-source-number-badges,
 html.smarttex-editor-scrolling #smarttex-comment-highlights,
 html.smarttex-editor-scrolling #smarttex-comment-icons,
 html.smarttex-editor-scrolling #smarttex-comment-selection-popup,
+html.smarttex-editor-scrolling #smarttex-review-comment-highlights,
+html.smarttex-editor-scrolling #smarttex-review-markup-layer,
+html.smarttex-editor-scrolling #smarttex-review-temporary-layer,
+html.smarttex-editor-scrolling #smarttex-collaboration-presence-layer,
+html.smarttex-editor-scrolling #smarttex-equation-preview,
+html.smarttex-editor-scrolling .smarttex-document-reference-popup,
+html.smarttex-editor-scrolling #smarttex-reference-autocomplete-popup,
+html.smarttex-editor-scrolling #smarttex-citation-popup,
+html.smarttex-editor-scrolling #smarttex-figure-autocomplete-popup,
+html.smarttex-editor-scrolling #smarttex-structure-hover-preview,
+html.smarttex-editor-scrolling #smarttex-review-change-popup,
+html.smarttex-editor-scrolling .smarttex-label-guard-dialog,
 html.smarttex-editor-scrolling .smarttex-label-guard-preview,
 html.smarttex-editor-scrolling .smarttex-popup-loading-spinner {
   visibility: hidden !important;
   pointer-events: none !important;
 }
 
-/* Freeze all SmartTeX source decoration while keys are being delivered. The
-   layers remain mounted, but are removed from painting until one consolidated
-   state/geometry refresh runs 500 ms after the final keyboard input. */
+/* Source decoration fades without doing editor work during typing. The pending
+   gate remains closed after the typing attribute clears until fresh source and
+   viewport geometry have been mounted. */
+#smarttex-source-structure-highlights,
+#smarttex-source-number-badges {
+  opacity: 1;
+  transition: opacity 2s ease;
+}
+
 html[data-smarttex-editor-typing="true"] #smarttex-source-structure-highlights,
 html[data-smarttex-editor-typing="true"] #smarttex-source-number-badges,
+html[data-smarttex-source-overlays-pending="true"] #smarttex-source-structure-highlights,
+html[data-smarttex-source-overlays-pending="true"] #smarttex-source-number-badges {
+  opacity: 0 !important;
+  pointer-events: none !important;
+}
+
+/* Manual scroll must suppress stale geometry immediately. Once scrolling ends,
+   the pending gate keeps opacity at zero until the refreshed overlays fade in. */
+html.smarttex-editor-scrolling #smarttex-source-structure-highlights,
+html.smarttex-editor-scrolling #smarttex-source-number-badges {
+  opacity: 0 !important;
+  transition: none;
+}
+
+html[data-smarttex-source-overlays-pending="true"]:not([data-smarttex-editor-typing="true"]) #smarttex-source-structure-highlights,
+html[data-smarttex-source-overlays-pending="true"]:not([data-smarttex-editor-typing="true"]) #smarttex-source-number-badges {
+  visibility: hidden !important;
+}
+
+/* Expensive comment decoration stays suppressed during typing. */
 html[data-smarttex-editor-typing="true"] #smarttex-comment-highlights,
 html[data-smarttex-editor-typing="true"] #smarttex-comment-icons,
 html[data-smarttex-editor-typing="true"] #smarttex-comment-selection-popup {

@@ -820,8 +820,14 @@
     optionsButton?.focus?.({ preventScroll: true });
   }, true);
 
-  window.addEventListener("resize", positionMenu, { passive: true });
-  window.addEventListener("scroll", positionMenu, { passive: true, capture: true });
+  const positionMenuOutsideScroll = () => {
+    if (!globalThis.SmartTeXInteractionTasks?.isScrolling?.()) positionMenu();
+  };
+  window.addEventListener("resize", positionMenuOutsideScroll, { passive: true });
+  window.addEventListener("scroll", positionMenuOutsideScroll, { passive: true, capture: true });
+  window.addEventListener("smarttex:editor-scroll-state", (event) => {
+    if (event?.detail?.active === false) positionMenu();
+  });
 
   extensionApi?.storage?.onChanged?.addListener?.((changes, areaName) => {
     if (areaName !== "local") return;

@@ -46,11 +46,12 @@ assert.equal(second.body, "{y+z}");
 
 const content = fs.readFileSync(path.join(root, "content.js"), "utf8");
 assert.match(content, /SOURCE_RENDER_DELAY_MS/);
-assert.match(content, /scheduleRender\(\{ immediate: !sourceChanged \}\)/);
-assert.match(content, /queueMicrotask\(\(\) =>/);
+assert.match(content, /cursorOnlyUpdate[\s\S]*scheduleEnvironmentPreviewSession\(session, cursorOnlyUpdate\)/);
+assert.match(content, /session\.immediateRequested[\s\S]*if \(runImmediately \|\| cacheOnly\)[\s\S]*runEnvironmentPreviewSession\(session, \{ cacheOnly \}\)[\s\S]*Math\.max\(48, typingDelay\)/);
 assert.match(content, /equationRenderData: new Map\(\)/);
 assert.match(content, /activeEquationContextForState\(state\) \|\| cachedEquationContextForState\(state\)/);
-assert.match(content, /activePreviewState = currentState;\s*window\.requestAnimationFrame\(\(\) => positionPreview\(\)\);\s*return;/s);
+assert.match(content, /const equationRenderData = equationRenderDataForState\(state, context\)/);
+assert.match(content, /sourceChanged \? canonicalPreviewBaseMarkup\(lastSuccessfulMarkup\) : ""/);
 assert.match(
   content,
   /if \(generation !== renderGeneration\) return;\s*if \(!stateCanShowPreview\(state\)\) \{\s*hidePreview\(\)/s,
@@ -61,6 +62,6 @@ const bridge = fs.readFileSync(path.join(root, "page-bridge.js"), "utf8");
 assert.match(bridge, /if \(source === cachedStructureSource\) \{ scheduleOverlayRender\(\); return; \}/);
 assert.match(bridge, /scroller\?\.addEventListener\("scroll", scheduleOverlayRender/);
 assert.match(bridge, /editor\.renderer\?\.on\?\.\("afterRender", scheduleOverlayRender\)/);
-assert.match(bridge, /queueMicrotask\(emitState\)/);
+assert.match(bridge, /queueMicrotask\(\(\) => emitState\(revision\)\)/);
 
 console.log(`Equation cursor performance regression checks passed (${elapsed.toFixed(1)} ms for 10,000 cached lookups).`);
